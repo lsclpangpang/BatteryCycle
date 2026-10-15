@@ -297,15 +297,15 @@ final class BatteryModel: ObservableObject {
         }
 
         guard charging else { return }
-        // 闪电：先在填充上挖出一圈空隙，再画实心闪电
+        // 闪电：比电池略高、上下探出外框，先挖出一圈空隙再画实心闪电
         let bolt = NSBezierPath()
         let x = rect.minX, y = rect.minY
-        bolt.move(to: NSPoint(x: x + 13, y: y + 10.5))
-        bolt.line(to: NSPoint(x: x + 8.5, y: y + 4.8))
-        bolt.line(to: NSPoint(x: x + 11.2, y: y + 4.8))
-        bolt.line(to: NSPoint(x: x + 9, y: y + 0.5))
-        bolt.line(to: NSPoint(x: x + 13.5, y: y + 6.2))
-        bolt.line(to: NSPoint(x: x + 10.8, y: y + 6.2))
+        bolt.move(to: NSPoint(x: x + 14, y: y + 12.5))
+        bolt.line(to: NSPoint(x: x + 7.5, y: y + 4.6))
+        bolt.line(to: NSPoint(x: x + 11.3, y: y + 4.6))
+        bolt.line(to: NSPoint(x: x + 8.5, y: y - 1.5))
+        bolt.line(to: NSPoint(x: x + 15, y: y + 6.6))
+        bolt.line(to: NSPoint(x: x + 11.2, y: y + 6.6))
         bolt.close()
         bolt.lineJoinStyle = .round
         let context = NSGraphicsContext.current
