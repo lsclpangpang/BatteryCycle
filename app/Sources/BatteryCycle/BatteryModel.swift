@@ -34,6 +34,8 @@ final class BatteryModel: ObservableObject {
 
     @Published var pct: Int?
     @Published var onAC = false
+    /// 系统报告电池正在充电（不论是本 App 的充电阶段还是暂停时系统自己充）
+    @Published var isCharging = false
     @Published var health: BatteryHealth?
     @Published var status: DaemonStatus?
     @Published var enabled = true
@@ -66,6 +68,7 @@ final class BatteryModel: ObservableObject {
         if let battery = Self.readBattery() {
             update(\.pct, battery.pct)
             update(\.onAC, battery.ac)
+            update(\.isCharging, battery.charging)
         }
         update(\.health, Self.readHealth())
         update(\.daemonInstalled, FileManager.default.fileExists(atPath: Self.daemonPlistPath))
@@ -102,7 +105,7 @@ final class BatteryModel: ObservableObject {
         }
     }
 
-    private static func readBattery() -> (pct: Int, ac: Bool)? {
+    private static func readBattery() -> (pct: Int, ac: Bool, charging: Bool)? {
         let info = IOPSCopyPowerSourcesInfo().takeRetainedValue()
         let list = IOPSCopyPowerSourcesList(info).takeRetainedValue() as [CFTypeRef]
         for ps in list {
@@ -111,7 +114,9 @@ final class BatteryModel: ObservableObject {
                   let cur = d[kIOPSCurrentCapacityKey] as? Int,
                   let max = d[kIOPSMaxCapacityKey] as? Int, max > 0
             else { continue }
-            return (cur * 100 / max, d[kIOPSPowerSourceStateKey] as? String == kIOPSACPowerValue)
+            return (cur * 100 / max,
+                    d[kIOPSPowerSourceStateKey] as? String == kIOPSACPowerValue,
+                    d[kIOPSIsChargingKey] as? Bool ?? false)
         }
         return nil
     }
@@ -244,38 +249,72 @@ final class BatteryModel: ObservableObject {
         pct.map { "\($0)%" } ?? "--"
     }
 
-    var menuBarSymbol: String {
-        if phase == .charge && onAC { return "battery.100percent.bolt" }
-        switch pct ?? 0 {
-        case ..<13: return "battery.0percent"
-        case ..<38: return "battery.25percent"
-        case ..<63: return "battery.50percent"
-        case ..<88: return "battery.75percent"
-        default: return "battery.100percent"
-        }
-    }
-
-    /// 菜单栏图标：电池图标 + 百分比画在同一张模板图里，宽度贴合内容
+    /// 菜单栏图标：仿系统样式，百分比在左，电池在右；电池内部按实际电量填充，
+    /// 正在充电时叠加闪电。整张画成模板图，深浅色菜单栏自动适配
     var menuBarImage: NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
-        let icon = NSImage(systemSymbolName: menuBarSymbol, accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: font.pointSize, weight: .regular))
         let text = percentText as NSString
         let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        let iconSize = icon?.size ?? .zero
         let textSize = text.size(withAttributes: attrs)
-        let spacing: CGFloat = 3
-        let height = ceil(max(iconSize.height, textSize.height))
-        let size = NSSize(width: ceil(iconSize.width + spacing + textSize.width), height: height)
+        let body = NSSize(width: 22, height: 11)
+        let nubWidth: CGFloat = 2
+        let spacing: CGFloat = 4
+        let height = ceil(max(body.height, textSize.height))
+        let size = NSSize(width: ceil(textSize.width + spacing + body.width + nubWidth), height: height)
+        let level = CGFloat(min(max(pct ?? 0, 0), 100)) / 100
+        let charging = isCharging
+
         let image = NSImage(size: size, flipped: false) { _ in
-            icon?.draw(in: NSRect(x: 0, y: (height - iconSize.height) / 2,
-                                  width: iconSize.width, height: iconSize.height))
-            text.draw(at: NSPoint(x: iconSize.width + spacing, y: (height - textSize.height) / 2),
-                      withAttributes: attrs)
+            text.draw(at: NSPoint(x: 0, y: (height - textSize.height) / 2), withAttributes: attrs)
+            Self.drawBattery(in: NSRect(origin: NSPoint(x: ceil(textSize.width) + spacing,
+                                                        y: (height - body.height) / 2), size: body),
+                             nubWidth: nubWidth, level: level, charging: charging)
             return true
         }
         image.isTemplate = true
         return image
+    }
+
+    private static func drawBattery(in rect: NSRect, nubWidth: CGFloat, level: CGFloat, charging: Bool) {
+        // 外框（半透明，和系统一样比填充浅）
+        let outline = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 3, yRadius: 3)
+        outline.lineWidth = 1
+        NSColor.black.withAlphaComponent(0.4).setStroke()
+        outline.stroke()
+
+        // 正极触点
+        let nub = NSRect(x: rect.maxX + 0.5, y: rect.midY - 2, width: nubWidth - 0.5, height: 4)
+        NSColor.black.withAlphaComponent(0.4).setFill()
+        NSBezierPath(roundedRect: nub, xRadius: 1, yRadius: 1).fill()
+
+        // 电量填充：宽度按百分比，有电时至少留一条细线可见
+        let inner = rect.insetBy(dx: 2, dy: 2)
+        if level > 0 {
+            let fill = NSRect(x: inner.minX, y: inner.minY,
+                              width: max(inner.width * level, 1.5), height: inner.height)
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: fill, xRadius: 1.5, yRadius: 1.5).fill()
+        }
+
+        guard charging else { return }
+        // 闪电：先在填充上挖出一圈空隙，再画实心闪电
+        let bolt = NSBezierPath()
+        let x = rect.minX, y = rect.minY
+        bolt.move(to: NSPoint(x: x + 13, y: y + 10.5))
+        bolt.line(to: NSPoint(x: x + 8.5, y: y + 4.8))
+        bolt.line(to: NSPoint(x: x + 11.2, y: y + 4.8))
+        bolt.line(to: NSPoint(x: x + 9, y: y + 0.5))
+        bolt.line(to: NSPoint(x: x + 13.5, y: y + 6.2))
+        bolt.line(to: NSPoint(x: x + 10.8, y: y + 6.2))
+        bolt.close()
+        bolt.lineJoinStyle = .round
+        let context = NSGraphicsContext.current
+        context?.compositingOperation = .destinationOut
+        bolt.lineWidth = 2
+        bolt.stroke()
+        context?.compositingOperation = .sourceOver
+        NSColor.black.setFill()
+        bolt.fill()
     }
 
     var title: String {
