@@ -65,14 +65,21 @@ struct MenuView: View {
 
     private var footer: some View {
         VStack(spacing: 10) {
-            if !model.daemonInstalled {
+            if !model.daemonInstalled || model.busy != nil {
                 Button {
                     model.installDaemon()
                 } label: {
-                    Text("安装后台服务").frame(maxWidth: .infinity)
+                    HStack(spacing: 6) {
+                        if model.busy != nil {
+                            ProgressView().controlSize(.small)
+                        }
+                        Text(model.busy ?? "安装后台服务")
+                    }
+                    .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
+                .disabled(model.busy != nil)
             }
 
             HStack {
@@ -85,7 +92,9 @@ struct MenuView: View {
                 Spacer()
                 Menu {
                     Button("重新安装后台服务") { model.installDaemon() }
+                        .disabled(model.busy != nil)
                     Button("卸载后台服务（恢复默认充电）") { model.uninstallDaemon() }
+                        .disabled(model.busy != nil)
                     Divider()
                     Button("退出") { NSApp.terminate(nil) }
                 } label: {

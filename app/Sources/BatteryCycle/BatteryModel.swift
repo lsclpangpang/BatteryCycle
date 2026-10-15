@@ -5,7 +5,7 @@ import ServiceManagement
 import SwiftUI
 
 /// 后台服务 batteryd 写出的状态（/var/run/batteryd.json）
-struct DaemonStatus: Decodable {
+struct DaemonStatus: Decodable, Equatable {
     let pct: Int
     let ac: Bool
     let phase: String
@@ -36,6 +36,8 @@ final class BatteryModel: ObservableObject {
     /// 读不到服务状态的具体原因，显示在面板上
     @Published var statusProblem: String?
     @Published var daemonInstalled = false
+    /// 正在安装 / 卸载时的提示，非 nil 时禁用相关按钮
+    @Published var busy: String?
 
     private var timer: Timer?
 
@@ -54,23 +56,27 @@ final class BatteryModel: ObservableObject {
 
     func refresh() {
         if let battery = Self.readBattery() {
-            pct = battery.pct
-            onAC = battery.ac
+            update(\.pct, battery.pct)
+            update(\.onAC, battery.ac)
         }
-        daemonInstalled = FileManager.default.fileExists(atPath: Self.daemonPlistPath)
+        update(\.daemonInstalled, FileManager.default.fileExists(atPath: Self.daemonPlistPath))
         do {
             let data = try Data(contentsOf: Self.statusURL)
             let s = try JSONDecoder().decode(DaemonStatus.self, from: data)
-            status = s
+            update(\.status, s)
             let age = Int(Date().timeIntervalSince1970 - s.updated)
-            statusProblem = age < 90 ? nil : "状态已 \(age) 秒没有更新"
+            update(\.statusProblem, age < 90 ? nil : "状态已 \(age) 秒没有更新")
         } catch let error as DecodingError {
-            status = nil
-            statusProblem = "状态文件无法解析：\(error)"
+            update(\.status, nil)
+            update(\.statusProblem, "状态文件无法解析：\(error)")
         } catch {
-            status = nil
-            statusProblem = "读不到 \(Self.statusURL.path)：\(error.localizedDescription)"
+            update(\.status, nil)
+            update(\.statusProblem, "读不到 \(Self.statusURL.path)：\(error.localizedDescription)")
         }
+    }
+
+    private func update<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<BatteryModel, T>, _ value: T) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
     }
 
     /// 服务每 30 秒写一次状态，超过 90 秒没更新视为未运行
@@ -150,28 +156,54 @@ final class BatteryModel: ObservableObject {
 
     /// 用 App 内置的脚本安装后台服务（弹出系统密码框）
     func installDaemon() {
-        runPrivileged(script: "install.sh", failure: "安装失败")
+        runPrivileged(script: "install.sh", action: "安装")
     }
 
     func uninstallDaemon() {
-        runPrivileged(script: "uninstall.sh", failure: "卸载失败")
+        runPrivileged(script: "uninstall.sh", action: "卸载")
     }
 
-    private func runPrivileged(script: String, failure: String) {
+    /// 在后台进程里用 osascript 申请管理员权限执行脚本，界面不会被卡住
+    private func runPrivileged(script: String, action: String) {
+        guard busy == nil else { return }
         guard let path = Bundle.main.url(forResource: script, withExtension: nil)?.path else {
-            message = "\(failure)：App 内缺少 \(script)"
+            message = "\(action)失败：App 内缺少 \(script)"
             return
         }
-        let escaped = path.replacingOccurrences(of: "\\", with: "\\\\")
+        let shell = "/bin/sh '\(path.replacingOccurrences(of: "'", with: "'\\''"))' > /var/log/batteryd-install.log 2>&1"
+        let escaped = shell.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-        let source = "do shell script \"/bin/sh \" & quoted form of \"\(escaped)\" with administrator privileges"
+        let source = "do shell script \"\(escaped)\" with administrator privileges"
 
-        var error: NSDictionary?
-        NSAppleScript(source: source)?.executeAndReturnError(&error)
-        if let error, (error[NSAppleScript.errorNumber] as? Int) != -128 {   // -128：用户点了取消
-            message = "\(failure)：\(error[NSAppleScript.errorMessage] as? String ?? "未知错误")"
-        } else {
-            message = nil
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", source]
+        process.standardOutput = FileHandle.nullDevice
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        process.terminationHandler = { [weak self] p in
+            let output = String(decoding: errorPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let status = p.terminationStatus
+            Task { @MainActor in
+                self?.finishPrivileged(action: action, status: status, output: output)
+            }
+        }
+
+        busy = "正在\(action)…"
+        message = nil
+        do {
+            try process.run()
+        } catch {
+            busy = nil
+            message = "\(action)失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func finishPrivileged(action: String, status: Int32, output: String) {
+        busy = nil
+        if status != 0 && !output.contains("-128") {   // -128：用户点了取消
+            let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            message = "\(action)失败：\(detail)（详情见 /var/log/batteryd-install.log）"
         }
         // 服务启动后几秒内会写出状态文件
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
