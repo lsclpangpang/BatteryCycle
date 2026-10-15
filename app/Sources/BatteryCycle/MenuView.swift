@@ -10,7 +10,8 @@ struct MenuView: View {
             if let health = model.health {
                 HealthRow(health: health)
             }
-            if let reached = model.reachedText {
+            // 只在放电阶段显示：这时它就是「从什么时候开始用电池」
+            if model.phase == .discharge, let reached = model.reachedText {
                 Label(reached, systemImage: "clock")
                     .font(.caption)
                     .foregroundStyle(.secondary)

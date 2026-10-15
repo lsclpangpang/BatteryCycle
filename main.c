@@ -220,8 +220,14 @@ static void tick(void) {
         save_state();
         save_reached(100);
         logf_("已充满到 %d%%，恢复循环", pct);
-    } else if (want_full != full_charge) {
-        logf_("%s", want_full ? "开始充满到 100%" : "已取消充满，恢复循环");
+    } else if (want_full && !full_charge) {
+        logf_("开始充满到 100%%");
+    } else if (!want_full && full_charge) {
+        // 取消：已超过上限就从这里开始放电，并把当前电量记为「上次充到」；否则继续充到上限
+        mode = pct >= high ? MODE_DISCHARGE : MODE_CHARGE;
+        save_state();
+        if (mode == MODE_DISCHARGE) save_reached(pct);
+        logf_("已取消充满（电量 %d%%），恢复循环", pct);
     }
     full_charge = want_full;
     if (full_charge) {
