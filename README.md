@@ -7,6 +7,8 @@
 - 电量 ≤ 10%：恢复充电器供电并开始充电，充到 75%
 - 然后重复
 
+需要出门时可以点「立即充满电」，确认后临时充到 100%，充满后自动回到循环，不用手动关掉再打开。
+
 菜单栏常驻图标显示当前电量，点击后可以查看电池健康度和充电循环次数、开关循环、调整上下限。
 
 适用于 Apple Silicon（M 系列）Mac，需要 macOS 13 或更高版本。
@@ -52,6 +54,7 @@ make install    # 复制到「应用程序」并打开
 | 路径 | 说明 |
 |---|---|
 | `/Library/Application Support/batteryd/config` | 设置（App 写入，服务读取） |
+| `/Library/Application Support/batteryd/fullcharge` | 存在时临时充到 100%（App 创建，服务充满后删除） |
 | `/var/run/batteryd.json` | 服务状态（服务写入，App 读取） |
 | `/var/db/batteryd.state` | 当前处于充电还是放电阶段，重启后继续 |
 | `/var/log/batteryd.log` | 服务日志 |

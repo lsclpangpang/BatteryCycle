@@ -23,13 +23,15 @@ struct BatteryHealth: Equatable {
 }
 
 enum Phase {
-    case offline, paused, charge, discharge
+    case offline, paused, charge, discharge, full
 }
 
 @MainActor
 final class BatteryModel: ObservableObject {
     static let statusURL = URL(fileURLWithPath: "/var/run/batteryd.json")
     static let configURL = URL(fileURLWithPath: "/Library/Application Support/batteryd/config")
+    /// 存在时后台服务临时充到 100%，充满后由服务删除
+    static let fullChargeURL = URL(fileURLWithPath: "/Library/Application Support/batteryd/fullcharge")
     static let daemonPlistPath = "/Library/LaunchDaemons/com.local.batteryd.plist"
 
     @Published var pct: Int?
@@ -101,6 +103,7 @@ final class BatteryModel: ObservableObject {
         switch s.phase {
         case "charge": return .charge
         case "discharge": return .discharge
+        case "full": return .full
         default: return .paused
         }
     }
@@ -166,6 +169,35 @@ final class BatteryModel: ObservableObject {
             message = nil
         } catch {
             message = "无法保存设置，请先安装后台服务"
+        }
+    }
+
+    /// 立即充满：创建标记文件，后台服务监听到目录变化后马上开始充电
+    func startFullCharge() {
+        if FileManager.default.createFile(atPath: Self.fullChargeURL.path, contents: Data()) {
+            message = nil
+        } else {
+            message = "无法开始充满，请先安装后台服务"
+        }
+        refreshSoon()
+    }
+
+    func cancelFullCharge() {
+        do {
+            try FileManager.default.removeItem(at: Self.fullChargeURL)
+            message = nil
+        } catch CocoaError.fileNoSuchFile {
+            // 服务刚好充满并已删除
+        } catch {
+            message = "无法取消充满：\(error.localizedDescription)"
+        }
+        refreshSoon()
+    }
+
+    /// 服务收到变化后很快写出新状态，不必等 3 秒的定时刷新
+    private func refreshSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.refresh()
         }
     }
 
@@ -346,6 +378,7 @@ final class BatteryModel: ObservableObject {
         case .paused: return "已暂停"
         case .charge: return onAC ? "充电中" : "等待接通电源"
         case .discharge: return "放电中"
+        case .full: return onAC ? "正在充满" : "等待接通电源"
         }
     }
 
@@ -357,6 +390,7 @@ final class BatteryModel: ObservableObject {
         case .paused: return "按系统默认方式充电"
         case .charge: return "充到 \(high)% 后停止充电"
         case .discharge: return "插着电也用电池，降到 \(low)% 后开始充电"
+        case .full: return "充到 100% 后自动恢复循环"
         }
     }
 
@@ -366,6 +400,7 @@ final class BatteryModel: ObservableObject {
         case .paused: return "pause.circle.fill"
         case .charge: return "bolt.fill"
         case .discharge: return "arrow.down.circle.fill"
+        case .full: return "bolt.circle.fill"
         }
     }
 
@@ -375,6 +410,7 @@ final class BatteryModel: ObservableObject {
         case .paused: return .secondary
         case .charge: return .green
         case .discharge: return .orange
+        case .full: return .blue
         }
     }
 }

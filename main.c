@@ -2,6 +2,7 @@
 //   电量 >= high：停止充电并断开适配器供电，由电池放电
 //   电量 <= low ：恢复适配器并开始充电
 // 设置读取自 CONFIG_FILE（菜单栏 App 写入），状态写到 STATUS_FILE 供 App 显示
+// FULL_FILE 存在时临时充到 100%，充满后删除它并回到循环
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/ps/IOPSKeys.h>
@@ -22,6 +23,7 @@
 #define CONFIG_FILE  CONFIG_DIR "/config"
 #define STATE_FILE   "/var/db/batteryd.state"
 #define STATUS_FILE  "/var/run/batteryd.json"
+#define FULL_FILE    CONFIG_DIR "/fullcharge"
 #define POLL_SECONDS 30
 
 typedef enum { MODE_CHARGE, MODE_DISCHARGE } Mode;
@@ -29,6 +31,7 @@ typedef enum { MODE_CHARGE, MODE_DISCHARGE } Mode;
 static bool enabled = true;
 static int low = 10, high = 75;
 static Mode mode;
+static bool full_charge;  // 正在一次性充满到 100%
 static bool has_chte, has_chie;  // 新固件（macOS 15+）的 key
 
 static io_connect_t pm_root;
@@ -134,7 +137,8 @@ static void load_config(void) {
 }
 
 static void write_status(int pct, bool on_ac) {
-    const char *phase = !enabled ? "paused" : (mode == MODE_CHARGE ? "charge" : "discharge");
+    const char *phase = full_charge ? "full"
+                      : !enabled ? "paused" : (mode == MODE_CHARGE ? "charge" : "discharge");
     FILE *f = fopen(STATUS_FILE ".tmp", "w");
     if (!f) return;
     fprintf(f, "{\"pct\":%d,\"ac\":%s,\"phase\":\"%s\",\"enabled\":%s,\"low\":%d,\"high\":%d,\"updated\":%ld}\n",
@@ -177,6 +181,22 @@ static void tick(void) {
     int pct = battery_percent(&on_ac);
     if (pct < 0) {
         logf_("读取电量失败");
+        return;
+    }
+
+    // 充满一次：不管循环设置，充到 100% 为止；App 删除 FULL_FILE 即取消
+    bool want_full = access(FULL_FILE, F_OK) == 0;
+    if (want_full && pct >= 100) {
+        unlink(FULL_FILE);
+        want_full = false;
+        logf_("已充满到 %d%%，恢复循环", pct);
+    } else if (want_full != full_charge) {
+        logf_("%s", want_full ? "开始充满到 100%" : "已取消充满，恢复循环");
+    }
+    full_charge = want_full;
+    if (full_charge) {
+        apply(MODE_CHARGE);
+        write_status(pct, on_ac);
         return;
     }
 
@@ -297,6 +317,7 @@ static int status(void) {
     printf("设置: %s，区间 %d%%–%d%%\n", enabled ? "已启用" : "已暂停", low, high);
     Mode m;
     if (load_state(&m)) printf("当前阶段: %s\n", m == MODE_CHARGE ? "充电" : "放电");
+    if (access(FULL_FILE, F_OK) == 0) printf("正在充满到 100%%\n");
     printf("SMC keys:\n");
     print_key("CHTE"); print_key("CH0B"); print_key("CH0C");
     print_key("CHIE"); print_key("CH0I");

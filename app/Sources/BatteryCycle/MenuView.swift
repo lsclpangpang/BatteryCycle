@@ -26,6 +26,8 @@ struct MenuView: View {
             }
             .disabled(!model.enabled)
 
+            FullChargeRow()
+
             Divider()
 
             SwitchRow(title: "登录时自动打开", isOn: Binding(
@@ -164,6 +166,45 @@ struct HealthRow: View {
         .font(.caption)
         .foregroundStyle(.secondary)
         .monospacedDigit()
+    }
+}
+
+/// 立即充满：点一次出现确认按钮，充满后服务自动回到循环
+struct FullChargeRow: View {
+    @EnvironmentObject var model: BatteryModel
+    @State private var confirming = false
+
+    var body: some View {
+        Group {
+            if model.phase == .full {
+                Button("取消充满") { model.cancelFullCharge() }
+                    .frame(maxWidth: .infinity)
+            } else if confirming {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("充到 100% 后自动恢复 \(model.low)%–\(model.high)% 循环")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Button("取消") { confirming = false }
+                        Spacer()
+                        Button("确认充满") {
+                            confirming = false
+                            model.startFullCharge()
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+            } else {
+                Button {
+                    confirming = true
+                } label: {
+                    Label("立即充满电", systemImage: "bolt.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .disabled(!model.daemonRunning)
+            }
+        }
+        .onDisappear { confirming = false }
     }
 }
 
