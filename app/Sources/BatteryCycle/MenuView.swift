@@ -10,6 +10,12 @@ struct MenuView: View {
             if let health = model.health {
                 HealthRow(health: health)
             }
+            if let reached = model.reachedText {
+                Label(reached, systemImage: "clock")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
 
             Divider()
 

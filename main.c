@@ -24,6 +24,7 @@
 #define STATE_FILE   "/var/db/batteryd.state"
 #define STATUS_FILE  "/var/run/batteryd.json"
 #define FULL_FILE    CONFIG_DIR "/fullcharge"
+#define REACHED_FILE "/var/db/batteryd.reached"
 #define POLL_SECONDS 30
 
 typedef enum { MODE_CHARGE, MODE_DISCHARGE } Mode;
@@ -32,6 +33,8 @@ static bool enabled = true;
 static int low = 10, high = 75;
 static Mode mode;
 static bool full_charge;  // 正在一次性充满到 100%
+static long reached_at;   // 上次充到上限（或充满）的时间，0 表示还没有
+static int reached_pct;   // 当时的上限值，充满时为 100
 static bool has_chte, has_chie;  // 新固件（macOS 15+）的 key
 
 static io_connect_t pm_root;
@@ -141,10 +144,33 @@ static void write_status(int pct, bool on_ac) {
                       : !enabled ? "paused" : (mode == MODE_CHARGE ? "charge" : "discharge");
     FILE *f = fopen(STATUS_FILE ".tmp", "w");
     if (!f) return;
-    fprintf(f, "{\"pct\":%d,\"ac\":%s,\"phase\":\"%s\",\"enabled\":%s,\"low\":%d,\"high\":%d,\"updated\":%ld}\n",
-            pct, on_ac ? "true" : "false", phase, enabled ? "true" : "false", low, high, (long)time(NULL));
+    fprintf(f, "{\"pct\":%d,\"ac\":%s,\"phase\":\"%s\",\"enabled\":%s,\"low\":%d,\"high\":%d,\"updated\":%ld,"
+               "\"reached_at\":%ld,\"reached_pct\":%d}\n",
+            pct, on_ac ? "true" : "false", phase, enabled ? "true" : "false", low, high, (long)time(NULL),
+            reached_at, reached_pct);
     fclose(f);
     rename(STATUS_FILE ".tmp", STATUS_FILE);
+}
+
+static void save_reached(int pct) {
+    reached_at = (long)time(NULL);
+    reached_pct = pct;
+    FILE *f = fopen(REACHED_FILE, "w");
+    if (!f) return;
+    fprintf(f, "%ld %d\n", reached_at, reached_pct);
+    fclose(f);
+}
+
+static void load_reached(void) {
+    FILE *f = fopen(REACHED_FILE, "r");
+    if (!f) return;
+    long t;
+    int p;
+    if (fscanf(f, "%ld %d", &t, &p) == 2) {
+        reached_at = t;
+        reached_pct = p;
+    }
+    fclose(f);
 }
 
 static void save_state(void) {
@@ -189,6 +215,10 @@ static void tick(void) {
     if (want_full && pct >= 100) {
         unlink(FULL_FILE);
         want_full = false;
+        // 直接进入放电阶段，免得下面的切换再把记录改成上限值
+        mode = MODE_DISCHARGE;
+        save_state();
+        save_reached(100);
         logf_("已充满到 %d%%，恢复循环", pct);
     } else if (want_full != full_charge) {
         logf_("%s", want_full ? "开始充满到 100%" : "已取消充满，恢复循环");
@@ -212,6 +242,7 @@ static void tick(void) {
     if (next != mode) {
         mode = next;
         save_state();
+        if (mode == MODE_DISCHARGE) save_reached(high);
         logf_("电量 %d%%，切换到 %s", pct, mode == MODE_CHARGE ? "充电" : "放电");
     }
     // 每次都重新写入：睡眠/唤醒或系统可能会重置这些 key
@@ -268,6 +299,7 @@ static void watch_config(void) {
 
 static int run(void) {
     load_config();
+    load_reached();
     if (!load_state(&mode)) {
         int pct = battery_percent(NULL);
         mode = (pct >= high) ? MODE_DISCHARGE : MODE_CHARGE;

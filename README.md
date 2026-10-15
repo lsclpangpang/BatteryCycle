@@ -57,4 +57,5 @@ make install    # 复制到「应用程序」并打开
 | `/Library/Application Support/batteryd/fullcharge` | 存在时临时充到 100%（App 创建，服务充满后删除） |
 | `/var/run/batteryd.json` | 服务状态（服务写入，App 读取） |
 | `/var/db/batteryd.state` | 当前处于充电还是放电阶段，重启后继续 |
+| `/var/db/batteryd.reached` | 上次充到上限的时间和当时的上限值 |
 | `/var/log/batteryd.log` | 服务日志 |

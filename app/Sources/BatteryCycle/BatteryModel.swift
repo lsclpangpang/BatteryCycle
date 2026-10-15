@@ -14,6 +14,9 @@ struct DaemonStatus: Decodable, Equatable {
     let low: Int
     let high: Int
     let updated: TimeInterval
+    /// 上次充到上限的时间（0 表示还没有）和当时的上限值；旧版服务没有这两项
+    let reachedAt: TimeInterval?
+    let reachedPct: Int?
 }
 
 /// 电池健康：当前满电容量占设计容量的百分比，以及充电循环次数
@@ -76,7 +79,9 @@ final class BatteryModel: ObservableObject {
         update(\.daemonInstalled, FileManager.default.fileExists(atPath: Self.daemonPlistPath))
         do {
             let data = try Data(contentsOf: Self.statusURL)
-            let s = try JSONDecoder().decode(DaemonStatus.self, from: data)
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            let s = try decoder.decode(DaemonStatus.self, from: data)
             update(\.status, s)
             let age = Int(Date().timeIntervalSince1970 - s.updated)
             update(\.statusProblem, age < 90 ? nil : "状态已 \(age) 秒没有更新")
@@ -370,6 +375,22 @@ final class BatteryModel: ObservableObject {
         cg?.restoreGState()
         NSColor.black.setFill()
         bolt.fill()
+    }
+
+    /// 例如「上次充到 75%：今天 14:32」
+    var reachedText: String? {
+        guard let s = status, let at = s.reachedAt, at > 0, let p = s.reachedPct else { return nil }
+        let date = Date(timeIntervalSince1970: at)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        if Calendar.current.isDateInToday(date) {
+            formatter.dateFormat = "'今天' HH:mm"
+        } else if Calendar.current.isDateInYesterday(date) {
+            formatter.dateFormat = "'昨天' HH:mm"
+        } else {
+            formatter.dateFormat = "M月d日 HH:mm"
+        }
+        return "上次充到 \(p)%：\(formatter.string(from: date))"
     }
 
     var title: String {
