@@ -264,12 +264,32 @@ final class BatteryModel: ObservableObject {
         let level = CGFloat(min(max(pct ?? 0, 0), 100)) / 100
         let charging = isCharging
 
-        let image = NSImage(size: size, flipped: false) { _ in
-            text.draw(at: NSPoint(x: 0, y: (height - textSize.height) / 2), withAttributes: attrs)
+        // 坐标都取整到整点，1x 和 2x 屏上线条和文字都落在像素格上，不会发虚
+        return Self.renderTemplate(size: size) {
+            text.draw(at: NSPoint(x: 0, y: round((height - textSize.height) / 2)), withAttributes: attrs)
             Self.drawBattery(in: NSRect(origin: NSPoint(x: ceil(textSize.width) + spacing,
-                                                        y: (height - body.height) / 2), size: body),
+                                                        y: floor((height - body.height) / 2)), size: body),
                              nubWidth: nubWidth, level: level, charging: charging)
-            return true
+        }
+    }
+
+    /// 按 1x/2x/3x 各画一份位图，系统按屏幕取最合适的一份。
+    /// 不用延迟绘制的 NSImage：SwiftUI 可能把它按 1x 栅格化后再放大，在 Retina 屏上发虚
+    private static func renderTemplate(size: NSSize, draw: () -> Void) -> NSImage {
+        let image = NSImage(size: size)
+        for scale: CGFloat in [1, 2, 3] {
+            guard let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+            else { continue }
+            rep.size = size
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            draw()
+            NSGraphicsContext.restoreGraphicsState()
+            image.addRepresentation(rep)
         }
         image.isTemplate = true
         return image
@@ -283,7 +303,7 @@ final class BatteryModel: ObservableObject {
         outline.stroke()
 
         // 正极触点
-        let nub = NSRect(x: rect.maxX + 0.5, y: rect.midY - 2, width: nubWidth - 0.5, height: 4)
+        let nub = NSRect(x: rect.maxX, y: floor(rect.midY - 2), width: nubWidth, height: 4)
         NSColor.black.withAlphaComponent(0.4).setFill()
         NSBezierPath(roundedRect: nub, xRadius: 1, yRadius: 1).fill()
 
