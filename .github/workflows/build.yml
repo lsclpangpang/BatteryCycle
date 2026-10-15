@@ -1,0 +1,44 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build BatteryCycle.app
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          ./app/build-app.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BatteryCycle
+          path: app/build/BatteryCycle.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/BatteryCycle.zip
+          body: |
+            下载 BatteryCycle.zip，解压后把 BatteryCycle.app 拖进“应用程序”。
+
+            第一次打开前在终端运行一次（App 没有经过苹果公证）：
+            ```
+            xattr -cr /Applications/BatteryCycle.app
+            ```
+            然后打开 App，点击菜单栏电池图标 →“安装后台服务”。
