@@ -9,8 +9,8 @@ struct BatteryCycleApp: App {
             MenuView()
                 .environmentObject(model)
         } label: {
-            Image(systemName: model.menuBarSymbol)
-            Text(model.percentText)
+            // 合成一张图，避免 SwiftUI 给图标和文字各自加留白
+            Image(nsImage: model.menuBarImage)
         }
         .menuBarExtraStyle(.window)
     }

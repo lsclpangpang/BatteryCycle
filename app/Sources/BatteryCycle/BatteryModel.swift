@@ -255,6 +255,29 @@ final class BatteryModel: ObservableObject {
         }
     }
 
+    /// 菜单栏图标：电池图标 + 百分比画在同一张模板图里，宽度贴合内容
+    var menuBarImage: NSImage {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
+        let icon = NSImage(systemSymbolName: menuBarSymbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: font.pointSize, weight: .regular))
+        let text = percentText as NSString
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        let iconSize = icon?.size ?? .zero
+        let textSize = text.size(withAttributes: attrs)
+        let spacing: CGFloat = 3
+        let height = ceil(max(iconSize.height, textSize.height))
+        let size = NSSize(width: ceil(iconSize.width + spacing + textSize.width), height: height)
+        let image = NSImage(size: size, flipped: false) { _ in
+            icon?.draw(in: NSRect(x: 0, y: (height - iconSize.height) / 2,
+                                  width: iconSize.width, height: iconSize.height))
+            text.draw(at: NSPoint(x: iconSize.width + spacing, y: (height - textSize.height) / 2),
+                      withAttributes: attrs)
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
     var title: String {
         switch phase {
         case .offline: return daemonInstalled ? "后台服务未运行" : "需要安装后台服务"
