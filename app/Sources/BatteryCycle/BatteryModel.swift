@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import IOKit
 import IOKit.ps
 import ServiceManagement
 import SwiftUI
@@ -15,6 +16,12 @@ struct DaemonStatus: Decodable, Equatable {
     let updated: TimeInterval
 }
 
+/// 电池健康：当前满电容量占设计容量的百分比，以及充电循环次数
+struct BatteryHealth: Equatable {
+    let percent: Int
+    let cycles: Int
+}
+
 enum Phase {
     case offline, paused, charge, discharge
 }
@@ -27,6 +34,7 @@ final class BatteryModel: ObservableObject {
 
     @Published var pct: Int?
     @Published var onAC = false
+    @Published var health: BatteryHealth?
     @Published var status: DaemonStatus?
     @Published var enabled = true
     @Published var low = 10
@@ -59,6 +67,7 @@ final class BatteryModel: ObservableObject {
             update(\.pct, battery.pct)
             update(\.onAC, battery.ac)
         }
+        update(\.health, Self.readHealth())
         update(\.daemonInstalled, FileManager.default.fileExists(atPath: Self.daemonPlistPath))
         do {
             let data = try Data(contentsOf: Self.statusURL)
@@ -105,6 +114,23 @@ final class BatteryModel: ObservableObject {
             return (cur * 100 / max, d[kIOPSPowerSourceStateKey] as? String == kIOPSACPowerValue)
         }
         return nil
+    }
+
+    /// 从 IORegistry 的 AppleSmartBattery 读取；Apple Silicon 上 MaxCapacity 恒为 100，
+    /// 实际满电容量（mAh）在 AppleRawMaxCapacity
+    private static func readHealth() -> BatteryHealth? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        func int(_ key: String) -> Int? {
+            IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue() as? Int
+        }
+        guard let design = int("DesignCapacity"), design > 0,
+              let full = int("AppleRawMaxCapacity") ?? int("NominalChargeCapacity"),
+              let cycles = int("CycleCount")
+        else { return nil }
+        return BatteryHealth(percent: Int((Double(full) * 100 / Double(design)).rounded()), cycles: cycles)
     }
 
     // MARK: - 设置

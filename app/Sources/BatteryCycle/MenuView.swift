@@ -7,6 +7,9 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 14) {
             header
             LevelBar(pct: model.pct ?? 0, low: model.low, high: model.high, tint: model.tint)
+            if let health = model.health {
+                HealthRow(health: health)
+            }
 
             Divider()
 
@@ -146,6 +149,21 @@ struct LevelBar: View {
             .fill(Color.primary.opacity(0.5))
             .frame(width: 2)
             .offset(x: width * CGFloat(value) / 100 - 1)
+    }
+}
+
+/// 电池健康度和充电循环次数
+struct HealthRow: View {
+    let health: BatteryHealth
+
+    var body: some View {
+        HStack(spacing: 16) {
+            Label("电池健康 \(health.percent)%", systemImage: "heart")
+            Label("充电循环 \(health.cycles) 次", systemImage: "arrow.triangle.2.circlepath")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .monospacedDigit()
     }
 }
 
