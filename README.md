@@ -28,6 +28,10 @@
 - 在 系统设置 → 电池 → 电池健康 中关闭「优化电池充电」
 - 退出 AlDente 等其他电池管理软件
 
+后台服务停止、无法控制充电、「立即充满」完成或作废时会发系统通知；到达上下限的通知默认关闭，可在面板里打开。出问题时可以在 ⋯ 菜单里「复制诊断信息」。
+
+更新 App 后，如果后台服务也有改动，面板会提示「更新后台服务」，点一下即可。
+
 卸载：面板右下角 ⋯ →「卸载后台服务」，然后删除 App。
 
 ## 从源码构建
@@ -54,7 +58,7 @@ make install    # 复制到「应用程序」并打开
 | 路径 | 说明 |
 |---|---|
 | `/Library/Application Support/batteryd/config` | 设置（App 写入，服务读取） |
-| `/Library/Application Support/batteryd/fullcharge` | 存在时临时充到 100%（App 创建，服务充满后删除） |
+| `/Library/Application Support/batteryd/fullcharge` | 存在时临时充到 100%（App 创建，服务充满后删除；12 小时内没充满自动作废） |
 | `/var/run/batteryd.json` | 服务状态（服务写入，App 读取） |
 | `/var/db/batteryd.state` | 当前处于充电还是放电阶段，重启后继续 |
 | `/var/db/batteryd.reached` | 上次充到上限的时间和当时的上限值 |

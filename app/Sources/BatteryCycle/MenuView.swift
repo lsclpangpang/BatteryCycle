@@ -42,6 +42,14 @@ struct MenuView: View {
                 set: { model.setLaunchAtLogin($0) }
             ))
 
+            SwitchRow(title: "到达上下限时通知", isOn: $model.notifyThresholds)
+
+            if let notice = model.notice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             if let message = model.message {
                 Text(message)
                     .font(.caption)
@@ -55,6 +63,7 @@ struct MenuView: View {
         .onAppear {
             model.loadConfig()
             model.refresh()
+            model.checkDaemonVersion()
         }
     }
 
@@ -77,7 +86,12 @@ struct MenuView: View {
 
     private var footer: some View {
         VStack(spacing: 10) {
-            if !model.daemonInstalled || model.busy != nil {
+            if model.daemonOutdated && model.busy == nil {
+                Text("App 已更新，后台服务还是旧版本，请更新一次")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if !model.daemonInstalled || model.daemonOutdated || model.busy != nil {
                 Button {
                     model.installDaemon()
                 } label: {
@@ -85,7 +99,7 @@ struct MenuView: View {
                         if model.busy != nil {
                             ProgressView().controlSize(.small)
                         }
-                        Text(model.busy ?? "安装后台服务")
+                        Text(model.busy ?? (model.daemonOutdated ? "更新后台服务" : "安装后台服务"))
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -107,6 +121,8 @@ struct MenuView: View {
                         .disabled(model.busy != nil)
                     Button("卸载后台服务（恢复默认充电）") { model.uninstallDaemon() }
                         .disabled(model.busy != nil)
+                    Divider()
+                    Button("复制诊断信息") { model.copyDiagnostics() }
                     Divider()
                     Button("退出") { NSApp.terminate(nil) }
                 } label: {
@@ -183,12 +199,12 @@ struct FullChargeRow: View {
 
     var body: some View {
         Group {
-            if model.phase == .full {
+            if model.fullChargeActive {
                 Button("取消充满") { model.cancelFullCharge() }
                     .frame(maxWidth: .infinity)
             } else if confirming {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("充到 100% 后自动恢复 \(model.low)%–\(model.high)% 循环")
+                    Text("充到 100% 后自动恢复 \(model.low)%–\(model.high)% 循环；12 小时内没充满会自动取消")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     HStack {

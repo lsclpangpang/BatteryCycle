@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include "smc.h"
@@ -26,6 +27,7 @@
 #define FULL_FILE    CONFIG_DIR "/fullcharge"
 #define REACHED_FILE "/var/db/batteryd.reached"
 #define POLL_SECONDS 30
+#define FULL_EXPIRE_SECONDS (12 * 3600)  // 充满请求超过这么久还没完成就作废
 
 typedef enum { MODE_CHARGE, MODE_DISCHARGE } Mode;
 
@@ -36,6 +38,7 @@ static bool full_charge;  // 正在一次性充满到 100%
 static long reached_at;   // 上次充到上限（或充满）的时间，0 表示还没有
 static int reached_pct;   // 当时的上限值，充满时为 100
 static bool has_chte, has_chie;  // 新固件（macOS 15+）的 key
+static char fault[96];           // 当前故障原因（SMC 写入失败、读不到电量），空串表示正常
 
 static io_connect_t pm_root;
 static IONotificationPortRef pm_port;
@@ -86,37 +89,57 @@ static int battery_percent(bool *on_ac) {
 
 // ---------- SMC 控制 ----------
 
+// 写入失败时把第一个失败的 key 记进 fault，供状态文件和日志使用
+static bool smc_set(const char *key, const uint8_t *v, uint32_t n) {
+    kern_return_t kr = smc_write(key, v, n);
+    if (kr != KERN_SUCCESS && !fault[0])
+        snprintf(fault, sizeof fault, "写入 SMC %s 失败（0x%x）", key, (unsigned)kr);
+    return kr == KERN_SUCCESS;
+}
+
 static bool set_charging(bool enable) {
     if (has_chte) {
         uint8_t v[4] = { enable ? 0x00 : 0x01, 0, 0, 0 };
-        return smc_write("CHTE", v, sizeof v) == KERN_SUCCESS;
+        return smc_set("CHTE", v, sizeof v);
     }
     uint8_t v = enable ? 0x00 : 0x02;
-    return smc_write("CH0B", &v, 1) == KERN_SUCCESS &&
-           smc_write("CH0C", &v, 1) == KERN_SUCCESS;
+    return smc_set("CH0B", &v, 1) && smc_set("CH0C", &v, 1);
 }
 
 static bool set_adapter(bool enable) {
     if (has_chie) {
         uint8_t v = enable ? 0x00 : 0x08;
-        return smc_write("CHIE", &v, 1) == KERN_SUCCESS;
+        return smc_set("CHIE", &v, 1);
     }
     uint8_t v = enable ? 0x00 : 0x01;
-    return smc_write("CH0I", &v, 1) == KERN_SUCCESS;
+    return smc_set("CH0I", &v, 1);
+}
+
+// 故障原因变化时才写日志，避免每 30 秒刷一条
+static void report_fault(void) {
+    static char logged[sizeof fault];
+    if (strcmp(fault, logged) == 0) return;
+    if (fault[0]) logf_("故障：%s", fault);
+    else logf_("故障已恢复");
+    strcpy(logged, fault);
 }
 
 static void apply(Mode m) {
-    bool ok;
-    if (m == MODE_CHARGE)
-        ok = set_adapter(true) && set_charging(true);
-    else
-        ok = set_charging(false) && set_adapter(false);
-    if (!ok) logf_("SMC 写入失败（需要 root 权限）");
+    fault[0] = 0;
+    // 先接通适配器再允许充电；放电时先停充电再断适配器，前一步失败就不做后一步
+    if (m == MODE_CHARGE) {
+        if (set_adapter(true)) set_charging(true);
+    } else {
+        if (set_charging(false)) set_adapter(false);
+    }
+    report_fault();
 }
 
 static void restore_defaults(void) {
+    fault[0] = 0;
     set_adapter(true);
     set_charging(true);
+    report_fault();
 }
 
 // ---------- 配置 / 状态文件 ----------
@@ -145,9 +168,10 @@ static void write_status(int pct, bool on_ac) {
     FILE *f = fopen(STATUS_FILE ".tmp", "w");
     if (!f) return;
     fprintf(f, "{\"pct\":%d,\"ac\":%s,\"phase\":\"%s\",\"enabled\":%s,\"low\":%d,\"high\":%d,\"updated\":%ld,"
-               "\"reached_at\":%ld,\"reached_pct\":%d}\n",
+               "\"reached_at\":%ld,\"reached_pct\":%d,\"fault\":\"%s\",\"keys\":\"%s %s\"}\n",
             pct, on_ac ? "true" : "false", phase, enabled ? "true" : "false", low, high, (long)time(NULL),
-            reached_at, reached_pct);
+            reached_at, reached_pct, fault,
+            has_chte ? "CHTE" : "CH0B/CH0C", has_chie ? "CHIE" : "CH0I");
     fclose(f);
     rename(STATUS_FILE ".tmp", STATUS_FILE);
 }
@@ -206,12 +230,23 @@ static void tick(void) {
     bool on_ac = false;
     int pct = battery_percent(&on_ac);
     if (pct < 0) {
-        logf_("读取电量失败");
+        // 照常写状态，App 马上能看到原因，而不是等状态过期
+        snprintf(fault, sizeof fault, "读取电量失败");
+        report_fault();
+        write_status(pct, on_ac);
         return;
     }
 
-    // 充满一次：不管循环设置，充到 100% 为止；App 删除 FULL_FILE 即取消
-    bool want_full = access(FULL_FILE, F_OK) == 0;
+    // 充满一次：不管循环设置，充到 100% 为止；App 删除 FULL_FILE 即取消。
+    // 请求时间就是文件的修改时间，太久没完成（一直没插电、系统卡在 80%）就作废，
+    // 免得几天后插上电突然充到 100%
+    struct stat st;
+    bool want_full = stat(FULL_FILE, &st) == 0;
+    if (want_full && time(NULL) - st.st_mtime > FULL_EXPIRE_SECONDS) {
+        unlink(FULL_FILE);
+        want_full = false;
+        logf_("充满请求超过 %d 小时未完成，自动取消", FULL_EXPIRE_SECONDS / 3600);
+    }
     if (want_full && pct >= 100) {
         unlink(FULL_FILE);
         want_full = false;
@@ -387,8 +422,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "需要 root 权限，请用 sudo 运行\n");
         return 1;
     }
-    if (!has_chte && !smc_key_exists("CH0B")) {
-        fprintf(stderr, "此机型不支持充电控制（找不到 CHTE/CH0B）\n");
+    if (!has_chte && !(smc_key_exists("CH0B") && smc_key_exists("CH0C"))) {
+        fprintf(stderr, "此机型不支持充电控制（找不到 CHTE 或 CH0B/CH0C）\n");
         return 1;
     }
     if (!has_chie && !smc_key_exists("CH0I")) {
