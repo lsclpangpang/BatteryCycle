@@ -39,6 +39,9 @@ final class BatteryModel: ObservableObject {
     static let fullChargeURL = URL(fileURLWithPath: "/Library/Application Support/batteryd/fullcharge")
     static let daemonPlistPath = "/Library/LaunchDaemons/com.local.batteryd.plist"
     static let daemonBinaryPath = "/usr/local/bin/batteryd"
+    /// 区间的合法范围，和 main.c 的 LOW_MIN…HIGH_MAX 一致；超出范围服务会拒绝整组设置
+    static let lowRange = 5...40
+    static let highRange = 50...100
 
     @Published var pct: Int?
     @Published var onAC = false
@@ -49,6 +52,8 @@ final class BatteryModel: ObservableObject {
     @Published var enabled = true
     @Published var low = 10
     @Published var high = 75
+    /// 存在充满请求文件；服务没运行时也要能取消
+    @Published var fullChargeRequested = false
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var message: String?
     /// 一般提示（灰色），几秒后自动消失
@@ -75,8 +80,9 @@ final class BatteryModel: ObservableObject {
 
     init() {
         Notifier.shared.setup()
-        loadConfig()
+        // 先读状态，配置无效时 loadConfig 可以改用服务实际在用的区间
         refresh()
+        loadConfig()
         checkDaemonVersion()
         // .common 模式：面板打开时也照常刷新
         let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
@@ -96,6 +102,7 @@ final class BatteryModel: ObservableObject {
         }
         update(\.health, Self.readHealth())
         update(\.daemonInstalled, FileManager.default.fileExists(atPath: Self.daemonPlistPath))
+        update(\.fullChargeRequested, FileManager.default.fileExists(atPath: Self.fullChargeURL.path))
         do {
             let data = try Data(contentsOf: Self.statusURL)
             let decoder = JSONDecoder()
@@ -228,9 +235,9 @@ final class BatteryModel: ObservableObject {
         status != nil && statusProblem == nil
     }
 
-    /// 正在一次性充满；出故障时 phase 显示故障，但仍要能取消
+    /// 正在一次性充满或有待处理的请求；出故障、服务没运行时也要能取消
     var fullChargeActive: Bool {
-        daemonRunning && status?.phase == "full"
+        fullChargeRequested || (daemonRunning && status?.phase == "full")
     }
 
     /// 逐字节比较已安装的 batteryd 和 App 内置的那份，不需要维护版本号
@@ -292,17 +299,27 @@ final class BatteryModel: ObservableObject {
 
     // MARK: - 设置
 
+    /// 校验规则和服务相同：区间超出范围时服务沿用之前的设置，这里也不显示文件里的值，
+    /// 改为显示服务实际在用的区间
     func loadConfig() {
         guard let text = try? String(contentsOf: Self.configURL, encoding: .utf8) else { return }
+        var l = low, h = high
         for line in text.split(separator: "\n") {
             let parts = line.split(separator: "=", maxSplits: 1)
             guard parts.count == 2, let value = Int(parts[1]) else { continue }
             switch parts[0] {
             case "enabled": enabled = value != 0
-            case "low": low = value
-            case "high": high = value
+            case "low": l = value
+            case "high": h = value
             default: break
             }
+        }
+        if Self.lowRange.contains(l) && Self.highRange.contains(h) {
+            low = l
+            high = h
+        } else if let s = status {
+            low = s.low
+            high = s.high
         }
     }
 
@@ -556,7 +573,7 @@ final class BatteryModel: ObservableObject {
         case .offline:
             if !daemonInstalled { return "首次使用，点击下方按钮安装，需要输入一次管理员密码" }
             return statusProblem ?? "后台服务没有响应"
-        case .fault: return "\(status?.fault ?? "")，充电可能不受控制，详情见 /var/log/batteryd.log"
+        case .fault: return "\(status?.fault ?? "")，已尝试恢复系统默认充电，详情见 /var/log/batteryd.log"
         case .paused: return "按系统默认方式充电"
         case .charge: return "充到 \(high)% 后停止充电"
         case .discharge: return "插着电也用电池，降到 \(low)% 后开始充电"

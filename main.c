@@ -28,6 +28,11 @@
 #define REACHED_FILE "/var/db/batteryd.reached"
 #define POLL_SECONDS 30
 #define FULL_EXPIRE_SECONDS (12 * 3600)  // 充满请求超过这么久还没完成就作废
+// 区间的合法范围，和 App 滑块的范围一致（BatteryModel.lowRange / highRange）
+#define LOW_MIN  5
+#define LOW_MAX  40
+#define HIGH_MIN 50
+#define HIGH_MAX 100
 
 typedef enum { MODE_CHARGE, MODE_DISCHARGE } Mode;
 
@@ -124,21 +129,28 @@ static void report_fault(void) {
     strcpy(logged, fault);
 }
 
-static void apply(Mode m) {
-    fault[0] = 0;
-    // 先接通适配器再允许充电；放电时先停充电再断适配器，前一步失败就不做后一步
-    if (m == MODE_CHARGE) {
-        if (set_adapter(true)) set_charging(true);
-    } else {
-        if (set_charging(false)) set_adapter(false);
-    }
-    report_fault();
+// 接通适配器并允许充电。两步都尝试，不因前一步失败而跳过；fault 保留第一个失败原因
+static bool write_defaults(void) {
+    bool ok = set_adapter(true);
+    return set_charging(true) && ok;
 }
 
-static void restore_defaults(void) {
+static bool restore_defaults(void) {
     fault[0] = 0;
-    set_adapter(true);
-    set_charging(true);
+    bool ok = write_defaults();
+    report_fault();
+    return ok;
+}
+
+// 任何一步失败都回退到系统默认充电：最坏情况是电池多充一些，
+// 而不是停留在「适配器已断开」之类不确定的半完成状态
+static void apply(Mode m) {
+    fault[0] = 0;
+    if (m == MODE_CHARGE) {
+        write_defaults();
+    } else if (!(set_charging(false) && set_adapter(false))) {
+        write_defaults();
+    }
     report_fault();
 }
 
@@ -156,9 +168,18 @@ static void load_config(void) {
     }
     fclose(f);
     enabled = e != 0;
-    if (l >= 5 && h <= 100 && l < h) {
+    if (l >= LOW_MIN && l <= LOW_MAX && h >= HIGH_MIN && h <= HIGH_MAX) {
         low = l;
         high = h;
+        return;
+    }
+    // 同一组无效值只记一次
+    static int bad_l = -1, bad_h = -1;
+    if (l != bad_l || h != bad_h) {
+        logf_("配置区间 %d%%–%d%% 无效（下限 %d–%d，上限 %d–%d），沿用 %d%%–%d%%",
+              l, h, LOW_MIN, LOW_MAX, HIGH_MIN, HIGH_MAX, low, high);
+        bad_l = l;
+        bad_h = h;
     }
 }
 
@@ -227,6 +248,17 @@ static void tick(void) {
     if (low != old_low || high != old_high)
         logf_("区间改为 %d%%–%d%%", low, high);
 
+    // 充满一次：不管循环设置，充到 100% 为止；App 删除 FULL_FILE 即取消。
+    // 请求时间就是文件的修改时间，太久没完成（一直没插电、系统卡在 80%）就作废，
+    // 免得几天后插上电突然充到 100%。读不到电量时也照常检查过期
+    struct stat st;
+    bool want_full = stat(FULL_FILE, &st) == 0;
+    if (want_full && time(NULL) - st.st_mtime > FULL_EXPIRE_SECONDS) {
+        unlink(FULL_FILE);
+        want_full = false;
+        logf_("充满请求超过 %d 小时未完成，自动取消", FULL_EXPIRE_SECONDS / 3600);
+    }
+
     bool on_ac = false;
     int pct = battery_percent(&on_ac);
     if (pct < 0) {
@@ -237,16 +269,6 @@ static void tick(void) {
         return;
     }
 
-    // 充满一次：不管循环设置，充到 100% 为止；App 删除 FULL_FILE 即取消。
-    // 请求时间就是文件的修改时间，太久没完成（一直没插电、系统卡在 80%）就作废，
-    // 免得几天后插上电突然充到 100%
-    struct stat st;
-    bool want_full = stat(FULL_FILE, &st) == 0;
-    if (want_full && time(NULL) - st.st_mtime > FULL_EXPIRE_SECONDS) {
-        unlink(FULL_FILE);
-        want_full = false;
-        logf_("充满请求超过 %d 小时未完成，自动取消", FULL_EXPIRE_SECONDS / 3600);
-    }
     if (want_full && pct >= 100) {
         unlink(FULL_FILE);
         want_full = false;
@@ -432,7 +454,10 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(cmd, "restore") == 0) {
-        restore_defaults();
+        if (!restore_defaults()) {
+            fprintf(stderr, "恢复默认充电失败：%s\n", fault);
+            return 1;
+        }
         unlink(STATE_FILE);
         printf("已恢复默认充电\n");
         return 0;
