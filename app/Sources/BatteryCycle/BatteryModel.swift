@@ -308,11 +308,14 @@ final class BatteryModel: ObservableObject {
         bolt.line(to: NSPoint(x: x + 11.2, y: y + 6.6))
         bolt.close()
         bolt.lineJoinStyle = .round
-        let context = NSGraphicsContext.current
-        context?.compositingOperation = .destinationOut
-        bolt.lineWidth = 2
+        // 用 clear 混合模式描一圈粗边，把闪电周围约 1.5pt 的填充和外框擦成透明
+        let cg = NSGraphicsContext.current?.cgContext
+        cg?.saveGState()
+        cg?.setBlendMode(.clear)
+        bolt.lineWidth = 3
         bolt.stroke()
-        context?.compositingOperation = .sourceOver
+        bolt.fill()
+        cg?.restoreGState()
         NSColor.black.setFill()
         bolt.fill()
     }
