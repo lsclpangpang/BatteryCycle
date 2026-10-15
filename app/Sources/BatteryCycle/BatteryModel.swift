@@ -23,6 +23,7 @@ enum Phase {
 final class BatteryModel: ObservableObject {
     static let statusURL = URL(fileURLWithPath: "/var/run/batteryd.json")
     static let configURL = URL(fileURLWithPath: "/Library/Application Support/batteryd/config")
+    static let daemonPlistPath = "/Library/LaunchDaemons/com.local.batteryd.plist"
 
     @Published var pct: Int?
     @Published var onAC = false
@@ -32,15 +33,21 @@ final class BatteryModel: ObservableObject {
     @Published var high = 75
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var message: String?
+    /// 读不到服务状态的具体原因，显示在面板上
+    @Published var statusProblem: String?
+    @Published var daemonInstalled = false
 
     private var timer: Timer?
 
     init() {
         loadConfig()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+        // .common 模式：面板打开时也照常刷新
+        let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
     // MARK: - 读取
@@ -50,18 +57,25 @@ final class BatteryModel: ObservableObject {
             pct = battery.pct
             onAC = battery.ac
         }
-        if let data = try? Data(contentsOf: Self.statusURL),
-           let s = try? JSONDecoder().decode(DaemonStatus.self, from: data) {
+        daemonInstalled = FileManager.default.fileExists(atPath: Self.daemonPlistPath)
+        do {
+            let data = try Data(contentsOf: Self.statusURL)
+            let s = try JSONDecoder().decode(DaemonStatus.self, from: data)
             status = s
-        } else {
+            let age = Int(Date().timeIntervalSince1970 - s.updated)
+            statusProblem = age < 90 ? nil : "状态已 \(age) 秒没有更新"
+        } catch let error as DecodingError {
             status = nil
+            statusProblem = "状态文件无法解析：\(error)"
+        } catch {
+            status = nil
+            statusProblem = "读不到 \(Self.statusURL.path)：\(error.localizedDescription)"
         }
     }
 
     /// 服务每 30 秒写一次状态，超过 90 秒没更新视为未运行
     var daemonRunning: Bool {
-        guard let s = status else { return false }
-        return Date().timeIntervalSince1970 - s.updated < 90
+        status != nil && statusProblem == nil
     }
 
     var phase: Phase {
@@ -185,7 +199,7 @@ final class BatteryModel: ObservableObject {
 
     var title: String {
         switch phase {
-        case .offline: return "后台服务未运行"
+        case .offline: return daemonInstalled ? "后台服务未运行" : "需要安装后台服务"
         case .paused: return "已暂停"
         case .charge: return onAC ? "充电中" : "等待接通电源"
         case .discharge: return "放电中"
@@ -194,7 +208,9 @@ final class BatteryModel: ObservableObject {
 
     var subtitle: String {
         switch phase {
-        case .offline: return "点击下方按钮安装，需要输入一次管理员密码"
+        case .offline:
+            if !daemonInstalled { return "首次使用，点击下方按钮安装，需要输入一次管理员密码" }
+            return statusProblem ?? "后台服务没有响应"
         case .paused: return "按系统默认方式充电"
         case .charge: return "充到 \(high)% 后停止充电"
         case .discharge: return "插着电也用电池，降到 \(low)% 后开始充电"
@@ -203,7 +219,7 @@ final class BatteryModel: ObservableObject {
 
     var phaseSymbol: String {
         switch phase {
-        case .offline: return "exclamationmark.triangle.fill"
+        case .offline: return daemonInstalled ? "exclamationmark.triangle.fill" : "arrow.down.app.fill"
         case .paused: return "pause.circle.fill"
         case .charge: return "bolt.fill"
         case .discharge: return "arrow.down.circle.fill"
@@ -212,7 +228,7 @@ final class BatteryModel: ObservableObject {
 
     var tint: Color {
         switch phase {
-        case .offline: return .red
+        case .offline: return daemonInstalled ? .red : .accentColor
         case .paused: return .secondary
         case .charge: return .green
         case .discharge: return .orange

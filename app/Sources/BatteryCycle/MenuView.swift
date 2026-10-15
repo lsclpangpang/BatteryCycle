@@ -65,7 +65,7 @@ struct MenuView: View {
 
     private var footer: some View {
         VStack(spacing: 10) {
-            if !model.daemonRunning {
+            if !model.daemonInstalled {
                 Button {
                     model.installDaemon()
                 } label: {
@@ -77,9 +77,9 @@ struct MenuView: View {
 
             HStack {
                 Circle()
-                    .fill(model.daemonRunning ? Color.green : Color.red)
+                    .fill(model.daemonRunning ? Color.green : (model.daemonInstalled ? Color.red : Color.orange))
                     .frame(width: 6, height: 6)
-                Text(model.daemonRunning ? "后台服务运行中" : "后台服务未运行")
+                Text(model.daemonRunning ? "后台服务运行中" : (model.daemonInstalled ? "后台服务未运行" : "后台服务未安装"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
