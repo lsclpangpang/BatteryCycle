@@ -95,14 +95,22 @@ static int battery_percent(bool *on_ac) {
     return pct;
 }
 
-// 放电阶段用 CHIE/CH0I 断开了适配器供电，系统可能报告为电池供电，
-// 所以另外看有没有检测到适配器。拿不准时当作没接，最多是允许睡眠
+// 放电阶段用 CHIE/CH0I 断开了适配器供电，系统报告为电池供电，ExternalConnected 和
+// IOPSCopyExternalPowerAdapterDetails 也都显示没接；只有 AppleSmartBattery 的
+// AdapterDetails 还保留着充电器协商出的功率，用它判断是否插着电源
 static bool adapter_connected(bool on_ac) {
     if (on_ac) return true;
-    CFDictionaryRef details = IOPSCopyExternalPowerAdapterDetails();
-    if (!details) return false;
-    CFRelease(details);
-    return true;
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"));
+    if (!svc) return false;
+    int watts = 0;
+    CFTypeRef details = IORegistryEntryCreateCFProperty(svc, CFSTR("AdapterDetails"), kCFAllocatorDefault, 0);
+    if (details && CFGetTypeID(details) == CFDictionaryGetTypeID()) {
+        CFNumberRef n = CFDictionaryGetValue(details, CFSTR("Watts"));
+        if (n) CFNumberGetValue(n, kCFNumberIntType, &watts);
+    }
+    if (details) CFRelease(details);
+    IOObjectRelease(svc);
+    return watts > 0;
 }
 
 // ---------- SMC 控制 ----------
