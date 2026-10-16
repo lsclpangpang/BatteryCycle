@@ -182,7 +182,7 @@ static void keep_awake(bool on, const char *why) {
     }
     static bool failure_logged;
     IOReturn r = IOPMAssertionCreateWithName(kIOPMAssertPreventUserIdleSystemSleep, kIOPMAssertionLevelOn,
-                                             CFSTR("batteryd：循环充放电期间阻止自动睡眠"), &awake_assertion);
+                                             CFSTR("batteryd: cycling on AC, prevent idle sleep"), &awake_assertion);
     if (r != kIOReturnSuccess) {
         awake_assertion = kIOPMNullAssertionID;
         if (!failure_logged) logf_("警告：无法阻止自动睡眠（0x%x）", (unsigned)r);
