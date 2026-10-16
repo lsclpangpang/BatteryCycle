@@ -47,6 +47,9 @@ final class BatteryModel: ObservableObject {
     @Published var onAC = false
     /// 系统报告电池正在充电（不论是本 App 的充电阶段还是暂停时系统自己充）
     @Published var isCharging = false
+    /// 接着电源但没在充电（显示插头）。拔电源时系统先报告「不在充电」，过一会儿才报告改用电池，
+    /// 中间这段不能算；所以从充电变过来的要持续几秒才算，原本就没在充（刚插上）的立即算
+    @Published var pluggedNotCharging = false
     @Published var health: BatteryHealth?
     @Published var status: DaemonStatus?
     @Published var enabled = true
@@ -71,6 +74,8 @@ final class BatteryModel: ObservableObject {
     @Published var busy: String?
 
     private var timer: Timer?
+    /// 开始「接着电源但没在充电」的时间，见 pluggedNotCharging
+    private var notChargingSince: Date?
     /// 上一次读到的有效状态，和新状态比较得出要通知的事件
     private var lastFresh: DaemonStatus?
     private var offlineSince: Date?
@@ -96,6 +101,15 @@ final class BatteryModel: ObservableObject {
 
     func refresh() {
         if let battery = Self.readBattery() {
+            if battery.ac && !battery.charging {
+                // 用更新前的 isCharging 判断是不是从充电变过来的
+                let since = notChargingSince ?? (isCharging ? Date() : .distantPast)
+                notChargingSince = since
+                update(\.pluggedNotCharging, Date().timeIntervalSince(since) >= 6)
+            } else {
+                notChargingSince = nil
+                update(\.pluggedNotCharging, false)
+            }
             update(\.pct, battery.pct)
             update(\.onAC, battery.ac)
             update(\.isCharging, battery.charging)
@@ -468,7 +482,7 @@ final class BatteryModel: ObservableObject {
         let height = ceil(max(body.height, textSize.height))
         let size = NSSize(width: ceil(textSize.width + spacing + body.width + nubWidth), height: height)
         let level = CGFloat(min(max(pct ?? 0, 0), 100)) / 100
-        let glyph: BatteryGlyph = isCharging ? .bolt : onAC ? .plug : .none
+        let glyph: BatteryGlyph = isCharging ? .bolt : pluggedNotCharging ? .plug : .none
 
         // 坐标都取整到整点，1x 和 2x 屏上线条和文字都落在像素格上，不会发虚
         return Self.renderTemplate(size: size) {
@@ -524,6 +538,8 @@ final class BatteryModel: ObservableObject {
 
         let x = rect.minX, y = rect.minY
         let shape = NSBezierPath()
+        // 挖空用的描边宽度，符号周围的空隙约为它的一半；插头和系统一样留得窄一些
+        var knockoutWidth: CGFloat = 3
         switch glyph {
         case .none:
             return
@@ -537,19 +553,27 @@ final class BatteryModel: ObservableObject {
             shape.line(to: NSPoint(x: x + 11.2, y: y + 6.6))
             shape.close()
         case .plug:
-            // 插头：横放，左边是电线，中间插头主体，右边两根插脚；都落在整点上，1x 屏也清晰
-            shape.append(NSBezierPath(rect: NSRect(x: x + 4, y: y + 5, width: 5, height: 1)))
-            shape.append(NSBezierPath(roundedRect: NSRect(x: x + 9, y: y + 3, width: 5, height: 5),
-                                      xRadius: 1, yRadius: 1))
-            shape.append(NSBezierPath(rect: NSRect(x: x + 14, y: y + 4, width: 3, height: 1)))
-            shape.append(NSBezierPath(rect: NSRect(x: x + 14, y: y + 6, width: 3, height: 1)))
+            // 插头：仿系统样式竖放，两根插脚朝上探出外框，主体下端收窄成电线，电线伸到外框底边。
+            // 坐标取 0.5 的整数倍，2x 屏上落在像素格上
+            shape.move(to: NSPoint(x: x + 7.5, y: y + 9))
+            shape.line(to: NSPoint(x: x + 15, y: y + 9))
+            shape.line(to: NSPoint(x: x + 15, y: y + 5.5))
+            shape.line(to: NSPoint(x: x + 12.5, y: y + 3))
+            shape.line(to: NSPoint(x: x + 12.5, y: y - 0.5))
+            shape.line(to: NSPoint(x: x + 10, y: y - 0.5))
+            shape.line(to: NSPoint(x: x + 10, y: y + 3))
+            shape.line(to: NSPoint(x: x + 7.5, y: y + 5.5))
+            shape.close()
+            shape.append(NSBezierPath(rect: NSRect(x: x + 9, y: y + 9, width: 1.5, height: 3)))
+            shape.append(NSBezierPath(rect: NSRect(x: x + 12, y: y + 9, width: 1.5, height: 3)))
+            knockoutWidth = 2
         }
         shape.lineJoinStyle = .round
-        // 先用 clear 混合模式描一圈粗边，把符号周围约 1.5pt 的填充和外框擦成透明，再画实心符号
+        // 先用 clear 混合模式描一圈粗边，把符号周围的填充和外框擦成透明，再画实心符号
         let cg = NSGraphicsContext.current?.cgContext
         cg?.saveGState()
         cg?.setBlendMode(.clear)
-        shape.lineWidth = 3
+        shape.lineWidth = knockoutWidth
         shape.stroke()
         shape.fill()
         cg?.restoreGState()
@@ -579,9 +603,9 @@ final class BatteryModel: ObservableObject {
         case .fault: return "无法控制充电"
         case .paused: return "已暂停"
         // 插上电源后充电器要过几秒才开始充电（温度高时也可能暂停），按系统报告的实际状态显示，和菜单栏图标一致
-        case .charge: return !onAC ? "等待接通电源" : isCharging ? "充电中" : "已接通电源，暂未充电"
+        case .charge: return !onAC ? "等待接通电源" : pluggedNotCharging ? "已接通电源，暂未充电" : "充电中"
         case .discharge: return "放电中"
-        case .full: return !onAC ? "等待接通电源" : isCharging ? "正在充满" : "已接通电源，暂未充电"
+        case .full: return !onAC ? "等待接通电源" : pluggedNotCharging ? "已接通电源，暂未充电" : "正在充满"
         }
     }
 
