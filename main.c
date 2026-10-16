@@ -10,6 +10,7 @@
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
+#include <notify.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -44,6 +45,8 @@ static long reached_at;   // 上次充到上限（或充满）的时间，0 表�
 static int reached_pct;   // 当时的上限值，充满时为 100
 static bool has_chte, has_chie;  // 新固件（macOS 15+）的 key
 static char fault[96];           // 当前故障原因（SMC 写入失败、读不到电量），空串表示正常
+
+static IOPMAssertionID awake_assertion = kIOPMNullAssertionID;
 
 static io_connect_t pm_root;
 static IONotificationPortRef pm_port;
@@ -90,6 +93,16 @@ static int battery_percent(bool *on_ac) {
     if (list) CFRelease(list);
     if (info) CFRelease(info);
     return pct;
+}
+
+// 放电阶段用 CHIE/CH0I 断开了适配器供电，系统可能报告为电池供电，
+// 所以另外看有没有检测到适配器。拿不准时当作没接，最多是允许睡眠
+static bool adapter_connected(bool on_ac) {
+    if (on_ac) return true;
+    CFDictionaryRef details = IOPSCopyExternalPowerAdapterDetails();
+    if (!details) return false;
+    CFRelease(details);
+    return true;
 }
 
 // ---------- SMC 控制 ----------
@@ -152,6 +165,32 @@ static void apply(Mode m) {
         write_defaults();
     }
     report_fault();
+}
+
+// ---------- 阻止自动睡眠 ----------
+
+// 睡眠期间进程不运行，到了上下限也没法切换（充电阶段会越过上限）。
+// 接着电源、且循环启用或正在充满时阻止空闲自动睡眠；屏幕照常关闭，合盖仍会睡眠。
+// 只用电池时照常睡眠，省电（睡眠中放电阶段电量停在当前值，不会越过下限）
+static void keep_awake(bool on, const char *why) {
+    if (on == (awake_assertion != kIOPMNullAssertionID)) return;
+    if (!on) {
+        IOPMAssertionRelease(awake_assertion);
+        awake_assertion = kIOPMNullAssertionID;
+        logf_("已允许自动睡眠（%s）", why);
+        return;
+    }
+    static bool failure_logged;
+    IOReturn r = IOPMAssertionCreateWithName(kIOPMAssertPreventUserIdleSystemSleep, kIOPMAssertionLevelOn,
+                                             CFSTR("batteryd：循环充放电期间阻止自动睡眠"), &awake_assertion);
+    if (r != kIOReturnSuccess) {
+        awake_assertion = kIOPMNullAssertionID;
+        if (!failure_logged) logf_("警告：无法阻止自动睡眠（0x%x）", (unsigned)r);
+        failure_logged = true;
+        return;
+    }
+    failure_logged = false;
+    logf_("已接通电源，阻止自动睡眠（合盖仍会睡眠）");
 }
 
 // ---------- 配置 / 状态文件 ----------
@@ -261,6 +300,8 @@ static void tick(void) {
 
     bool on_ac = false;
     int pct = battery_percent(&on_ac);
+    bool active = enabled || want_full;
+    keep_awake(active && adapter_connected(on_ac), active ? "未接电源" : "循环已暂停");
     if (pct < 0) {
         // 照常写状态，App 马上能看到原因，而不是等状态过期
         snprintf(fault, sizeof fault, "读取电量失败");
@@ -321,11 +362,14 @@ static void power_cb(void *ref, io_service_t svc, natural_t msg, void *arg) {
         break;
     case kIOMessageSystemWillSleep:
         // 睡眠期间进程不运行，恢复适配器供电，避免睡眠中电池被放空；
-        // 放电阶段仍保持不充电，电量停在当前值
+        // 放电阶段仍保持不充电，电量停在当前值。
+        // 记下睡眠和唤醒时的电量：充电阶段睡眠时没法在上限处停下，日志里能看出越过了多少
+        logf_("睡眠，电量 %d%%", battery_percent(NULL));
         set_adapter(true);
         IOAllowPowerChange(pm_root, (long)arg);
         break;
     case kIOMessageSystemHasPoweredOn:
+        logf_("唤醒，电量 %d%%", battery_percent(NULL));
         tick();
         break;
     }
@@ -344,6 +388,18 @@ static void watch_signal(int sig) {
     dispatch_source_t s = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, sig, 0, dispatch_get_main_queue());
     dispatch_source_set_event_handler(s, ^{ on_signal(); });
     dispatch_resume(s);
+}
+
+// 电量每变化 1% 或插拔电源时系统会发通知，收到就立即检查，
+// 不用等最多 30 秒的轮询；电量在下限附近掉得快时也不会错过
+static void watch_power_source(const char *name) {
+    int token;
+    uint32_t r = notify_register_dispatch(name, &token, dispatch_get_main_queue(), ^(int t) {
+        (void)t;
+        tick();
+    });
+    if (r != NOTIFY_STATUS_OK)
+        logf_("警告：无法监听 %s，电量变化将在 %d 秒内处理", name, POLL_SECONDS);
 }
 
 // App 修改设置时（写临时文件后 rename 进目录）立即生效，不用等下一次轮询
@@ -376,6 +432,8 @@ static int run(void) {
     watch_signal(SIGINT);
     watch_signal(SIGHUP);
     watch_config();
+    watch_power_source(kIOPSNotifyPercentChange);
+    watch_power_source(kIOPSNotifyPowerSource);
 
     pm_root = IORegisterForSystemPower(NULL, &pm_port, power_cb, &pm_notifier);
     if (pm_root) IONotificationPortSetDispatchQueue(pm_port, dispatch_get_main_queue());
