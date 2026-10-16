@@ -390,7 +390,7 @@ static void watch_signal(int sig) {
     dispatch_resume(s);
 }
 
-// 电量每变化 1% 或插拔电源时系统会发通知，收到就立即检查，
+// 电池信息有任何变化（电量、插拔电源）时系统会发通知，收到就立即检查，
 // 不用等最多 30 秒的轮询；电量在下限附近掉得快时也不会错过
 static void watch_power_source(const char *name) {
     int token;
@@ -432,8 +432,7 @@ static int run(void) {
     watch_signal(SIGINT);
     watch_signal(SIGHUP);
     watch_config();
-    watch_power_source(kIOPSNotifyPercentChange);
-    watch_power_source(kIOPSNotifyPowerSource);
+    watch_power_source(kIOPSNotifyAnyPowerSource);
 
     pm_root = IORegisterForSystemPower(NULL, &pm_port, power_cb, &pm_notifier);
     if (pm_root) IONotificationPortSetDispatchQueue(pm_port, dispatch_get_main_queue());
