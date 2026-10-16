@@ -450,8 +450,13 @@ final class BatteryModel: ObservableObject {
         pct.map { "\($0)%" } ?? "--"
     }
 
+    /// 电池图标内叠加的符号，和系统一致：正在充电是闪电，接着电源但没在充电是插头
+    private enum BatteryGlyph {
+        case none, bolt, plug
+    }
+
     /// 菜单栏图标：仿系统样式，百分比在左，电池在右；电池内部按实际电量填充，
-    /// 正在充电时叠加闪电。整张画成模板图，深浅色菜单栏自动适配
+    /// 叠加闪电或插头。整张画成模板图，深浅色菜单栏自动适配
     var menuBarImage: NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
         let text = percentText as NSString
@@ -463,14 +468,14 @@ final class BatteryModel: ObservableObject {
         let height = ceil(max(body.height, textSize.height))
         let size = NSSize(width: ceil(textSize.width + spacing + body.width + nubWidth), height: height)
         let level = CGFloat(min(max(pct ?? 0, 0), 100)) / 100
-        let charging = isCharging
+        let glyph: BatteryGlyph = isCharging ? .bolt : onAC ? .plug : .none
 
         // 坐标都取整到整点，1x 和 2x 屏上线条和文字都落在像素格上，不会发虚
         return Self.renderTemplate(size: size) {
             text.draw(at: NSPoint(x: 0, y: round((height - textSize.height) / 2)), withAttributes: attrs)
             Self.drawBattery(in: NSRect(origin: NSPoint(x: ceil(textSize.width) + spacing,
                                                         y: floor((height - body.height) / 2)), size: body),
-                             nubWidth: nubWidth, level: level, charging: charging)
+                             nubWidth: nubWidth, level: level, glyph: glyph)
         }
     }
 
@@ -496,7 +501,7 @@ final class BatteryModel: ObservableObject {
         return image
     }
 
-    private static func drawBattery(in rect: NSRect, nubWidth: CGFloat, level: CGFloat, charging: Bool) {
+    private static func drawBattery(in rect: NSRect, nubWidth: CGFloat, level: CGFloat, glyph: BatteryGlyph) {
         // 外框（半透明，和系统一样比填充浅）
         let outline = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 3, yRadius: 3)
         outline.lineWidth = 1
@@ -517,28 +522,39 @@ final class BatteryModel: ObservableObject {
             NSBezierPath(roundedRect: fill, xRadius: 1.5, yRadius: 1.5).fill()
         }
 
-        guard charging else { return }
-        // 闪电：比电池略高、上下探出外框，先挖出一圈空隙再画实心闪电
-        let bolt = NSBezierPath()
         let x = rect.minX, y = rect.minY
-        bolt.move(to: NSPoint(x: x + 14, y: y + 12.5))
-        bolt.line(to: NSPoint(x: x + 7.5, y: y + 4.6))
-        bolt.line(to: NSPoint(x: x + 11.3, y: y + 4.6))
-        bolt.line(to: NSPoint(x: x + 8.5, y: y - 1.5))
-        bolt.line(to: NSPoint(x: x + 15, y: y + 6.6))
-        bolt.line(to: NSPoint(x: x + 11.2, y: y + 6.6))
-        bolt.close()
-        bolt.lineJoinStyle = .round
-        // 用 clear 混合模式描一圈粗边，把闪电周围约 1.5pt 的填充和外框擦成透明
+        let shape = NSBezierPath()
+        switch glyph {
+        case .none:
+            return
+        case .bolt:
+            // 闪电：比电池略高、上下探出外框
+            shape.move(to: NSPoint(x: x + 14, y: y + 12.5))
+            shape.line(to: NSPoint(x: x + 7.5, y: y + 4.6))
+            shape.line(to: NSPoint(x: x + 11.3, y: y + 4.6))
+            shape.line(to: NSPoint(x: x + 8.5, y: y - 1.5))
+            shape.line(to: NSPoint(x: x + 15, y: y + 6.6))
+            shape.line(to: NSPoint(x: x + 11.2, y: y + 6.6))
+            shape.close()
+        case .plug:
+            // 插头：横放，左边是电线，中间插头主体，右边两根插脚；都落在整点上，1x 屏也清晰
+            shape.append(NSBezierPath(rect: NSRect(x: x + 4, y: y + 5, width: 5, height: 1)))
+            shape.append(NSBezierPath(roundedRect: NSRect(x: x + 9, y: y + 3, width: 5, height: 5),
+                                      xRadius: 1, yRadius: 1))
+            shape.append(NSBezierPath(rect: NSRect(x: x + 14, y: y + 4, width: 3, height: 1)))
+            shape.append(NSBezierPath(rect: NSRect(x: x + 14, y: y + 6, width: 3, height: 1)))
+        }
+        shape.lineJoinStyle = .round
+        // 先用 clear 混合模式描一圈粗边，把符号周围约 1.5pt 的填充和外框擦成透明，再画实心符号
         let cg = NSGraphicsContext.current?.cgContext
         cg?.saveGState()
         cg?.setBlendMode(.clear)
-        bolt.lineWidth = 3
-        bolt.stroke()
-        bolt.fill()
+        shape.lineWidth = 3
+        shape.stroke()
+        shape.fill()
         cg?.restoreGState()
         NSColor.black.setFill()
-        bolt.fill()
+        shape.fill()
     }
 
     /// 例如「上次充到 75%：今天 14:32」
@@ -562,9 +578,10 @@ final class BatteryModel: ObservableObject {
         case .offline: return daemonInstalled ? "后台服务未运行" : "需要安装后台服务"
         case .fault: return "无法控制充电"
         case .paused: return "已暂停"
-        case .charge: return onAC ? "充电中" : "等待接通电源"
+        // 插上电源后充电器要过几秒才开始充电（温度高时也可能暂停），按系统报告的实际状态显示，和菜单栏图标一致
+        case .charge: return !onAC ? "等待接通电源" : isCharging ? "充电中" : "已接通电源，暂未充电"
         case .discharge: return "放电中"
-        case .full: return onAC ? "正在充满" : "等待接通电源"
+        case .full: return !onAC ? "等待接通电源" : isCharging ? "正在充满" : "已接通电源，暂未充电"
         }
     }
 
