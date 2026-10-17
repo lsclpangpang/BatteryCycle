@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import IOKit
 import IOKit.ps
+import IOKit.pwr_mgt
 import ServiceManagement
 import SwiftUI
 
@@ -65,6 +66,13 @@ final class BatteryModel: ObservableObject {
     @Published var notifyThresholds = UserDefaults.standard.bool(forKey: "notifyThresholds") {
         didSet { UserDefaults.standard.set(notifyThresholds, forKey: "notifyThresholds") }
     }
+    /// App 运行期间阻止屏幕因空闲熄灭；默认开
+    @Published var keepDisplayOn = UserDefaults.standard.object(forKey: "keepDisplayOn") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(keepDisplayOn, forKey: "keepDisplayOn")
+            applyKeepDisplayOn()
+        }
+    }
     /// 读不到服务状态的具体原因，显示在面板上
     @Published var statusProblem: String?
     @Published var daemonInstalled = false
@@ -74,6 +82,8 @@ final class BatteryModel: ObservableObject {
     @Published var busy: String?
 
     private var timer: Timer?
+    /// 阻止屏幕熄灭的断言；App 退出时系统自动释放
+    private var displayAssertion = IOPMAssertionID(kIOPMNullAssertionID)
     /// 开始「接着电源但没在充电」的时间，见 pluggedNotCharging
     private var notChargingSince: Date?
     /// 上一次读到的有效状态，和新状态比较得出要通知的事件
@@ -85,6 +95,7 @@ final class BatteryModel: ObservableObject {
 
     init() {
         Notifier.shared.setup()
+        applyKeepDisplayOn()
         // 先读状态，配置无效时 loadConfig 可以改用服务实际在用的区间
         refresh()
         loadConfig()
@@ -395,6 +406,25 @@ final class BatteryModel: ObservableObject {
             message = "无法设置登录启动：\(error.localizedDescription)"
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
+    /// 只阻止空闲熄屏：手动锁屏、合盖仍然照常
+    private func applyKeepDisplayOn() {
+        let active = displayAssertion != IOPMAssertionID(kIOPMNullAssertionID)
+        guard keepDisplayOn != active else { return }
+        if !keepDisplayOn {
+            IOPMAssertionRelease(displayAssertion)
+            displayAssertion = IOPMAssertionID(kIOPMNullAssertionID)
+            return
+        }
+        // 名字用 ASCII，pmset -g assertions 才能正常显示
+        let r = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                                            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                            "BatteryCycle: keep display on" as CFString, &displayAssertion)
+        if r != kIOReturnSuccess {
+            displayAssertion = IOPMAssertionID(kIOPMNullAssertionID)
+            message = "无法阻止屏幕熄灭（0x\(String(UInt32(bitPattern: r), radix: 16))）"
+        }
     }
 
     // MARK: - 后台服务

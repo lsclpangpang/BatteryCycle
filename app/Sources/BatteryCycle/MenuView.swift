@@ -42,6 +42,8 @@ struct MenuView: View {
                 set: { model.setLaunchAtLogin($0) }
             ))
 
+            SwitchRow(title: "保持屏幕常亮", isOn: $model.keepDisplayOn)
+
             SwitchRow(title: "到达上下限时通知", isOn: $model.notifyThresholds)
 
             if let notice = model.notice {
