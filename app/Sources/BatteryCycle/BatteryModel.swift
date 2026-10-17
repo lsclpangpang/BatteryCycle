@@ -75,10 +75,12 @@ final class BatteryModel: ObservableObject {
         }
     }
     /// 保持常亮时，无操作多少分钟后锁屏；锁屏后屏幕仍然常亮
-    @Published var lockAfterMinutes = UserDefaults.standard.object(forKey: "lockAfterMinutes") as? Int ?? 10 {
+    /// 夹到范围内：旧版的范围是 5–60 分钟
+    @Published var lockAfterMinutes = min(max(UserDefaults.standard.object(forKey: "lockAfterMinutes") as? Int ?? 10,
+                                              BatteryModel.lockRange.lowerBound), BatteryModel.lockRange.upperBound) {
         didSet { UserDefaults.standard.set(lockAfterMinutes, forKey: "lockAfterMinutes") }
     }
-    static let lockRange = 5...60
+    static let lockRange = 1...10
     /// 读不到服务状态的具体原因，显示在面板上
     @Published var statusProblem: String?
     @Published var daemonInstalled = false

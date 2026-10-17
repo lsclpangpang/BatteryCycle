@@ -45,7 +45,7 @@ struct MenuView: View {
             SwitchRow(title: "保持屏幕常亮", isOn: $model.keepDisplayOn)
             if model.keepDisplayOn {
                 ThresholdSlider(title: "无操作多久后锁屏", value: $model.lockAfterMinutes,
-                                range: BatteryModel.lockRange, unit: " 分钟") {}
+                                range: BatteryModel.lockRange, step: 1, unit: " 分钟") {}
             }
 
             SwitchRow(title: "到达上下限时通知", isOn: $model.notifyThresholds)
@@ -258,6 +258,7 @@ struct ThresholdSlider: View {
     let title: String
     @Binding var value: Int
     let range: ClosedRange<Int>
+    var step = 5
     var unit = "%"
     let onCommit: () -> Void
 
@@ -273,7 +274,7 @@ struct ThresholdSlider: View {
             Slider(
                 value: Binding(get: { Double(value) }, set: { value = Int($0.rounded()) }),
                 in: Double(range.lowerBound)...Double(range.upperBound),
-                step: 5,
+                step: Double(step),
                 onEditingChanged: { editing in
                     if !editing { onCommit() }
                 }
