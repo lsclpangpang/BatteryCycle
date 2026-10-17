@@ -66,8 +66,8 @@ final class BatteryModel: ObservableObject {
     @Published var notifyThresholds = UserDefaults.standard.bool(forKey: "notifyThresholds") {
         didSet { UserDefaults.standard.set(notifyThresholds, forKey: "notifyThresholds") }
     }
-    /// App 运行期间阻止屏幕因空闲熄灭；默认开
-    @Published var keepDisplayOn = UserDefaults.standard.object(forKey: "keepDisplayOn") as? Bool ?? true {
+    /// 打开后 App 运行期间阻止屏幕因空闲熄灭；默认关
+    @Published var keepDisplayOn = UserDefaults.standard.bool(forKey: "keepDisplayOn") {
         didSet {
             UserDefaults.standard.set(keepDisplayOn, forKey: "keepDisplayOn")
             applyKeepDisplayOn()
