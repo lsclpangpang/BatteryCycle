@@ -66,13 +66,19 @@ final class BatteryModel: ObservableObject {
     @Published var notifyThresholds = UserDefaults.standard.bool(forKey: "notifyThresholds") {
         didSet { UserDefaults.standard.set(notifyThresholds, forKey: "notifyThresholds") }
     }
-    /// 打开后 App 运行期间阻止屏幕因空闲熄灭；默认关
+    /// 打开后 App 运行期间阻止屏幕因空闲熄灭；默认关。
+    /// 系统的自动锁屏靠屏保或熄屏触发，会一并被挡住，所以改由 App 按 lockAfterMinutes 自己锁屏
     @Published var keepDisplayOn = UserDefaults.standard.bool(forKey: "keepDisplayOn") {
         didSet {
             UserDefaults.standard.set(keepDisplayOn, forKey: "keepDisplayOn")
             applyKeepDisplayOn()
         }
     }
+    /// 保持常亮时，无操作多少分钟后锁屏；锁屏后屏幕仍然常亮
+    @Published var lockAfterMinutes = UserDefaults.standard.object(forKey: "lockAfterMinutes") as? Int ?? 10 {
+        didSet { UserDefaults.standard.set(lockAfterMinutes, forKey: "lockAfterMinutes") }
+    }
+    static let lockRange = 5...60
     /// 读不到服务状态的具体原因，显示在面板上
     @Published var statusProblem: String?
     @Published var daemonInstalled = false
@@ -84,6 +90,8 @@ final class BatteryModel: ObservableObject {
     private var timer: Timer?
     /// 阻止屏幕熄灭的断言；App 退出时系统自动释放
     private var displayAssertion = IOPMAssertionID(kIOPMNullAssertionID)
+    /// 这一段无操作期间已经锁过屏，有操作后才再次计时
+    private var lockedForIdle = false
     /// 开始「接着电源但没在充电」的时间，见 pluggedNotCharging
     private var notChargingSince: Date?
     /// 上一次读到的有效状态，和新状态比较得出要通知的事件
@@ -102,7 +110,10 @@ final class BatteryModel: ObservableObject {
         checkDaemonVersion()
         // .common 模式：面板打开时也照常刷新
         let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor in
+                self?.refresh()
+                self?.lockIfIdle()
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
@@ -426,6 +437,37 @@ final class BatteryModel: ObservableObject {
             message = "无法阻止屏幕熄灭（0x\(String(UInt32(bitPattern: r), radix: 16))）"
         }
     }
+
+    private func lockIfIdle() {
+        guard keepDisplayOn else { return }
+        // ~0 即 kCGAnyInputEventType：键盘、鼠标、触控板任一操作
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+        guard idle >= Double(lockAfterMinutes * 60) else {
+            lockedForIdle = false
+            return
+        }
+        guard !lockedForIdle else { return }
+        lockedForIdle = true
+        if Self.screenIsLocked() { return }
+        if let lock = Self.lockScreenImmediate {
+            _ = lock()
+        } else {
+            message = "无法自动锁屏"
+        }
+    }
+
+    private static func screenIsLocked() -> Bool {
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        return session?["CGSSessionScreenIsLocked"] as? Bool ?? false
+    }
+
+    /// 系统「锁定屏幕」菜单项用的私有函数，不需要辅助功能权限
+    private static let lockScreenImmediate: (@convention(c) () -> Int32)? = {
+        guard let handle = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login", RTLD_LAZY),
+              let sym = dlsym(handle, "SACLockScreenImmediate")
+        else { return nil }
+        return unsafeBitCast(sym, to: (@convention(c) () -> Int32).self)
+    }()
 
     // MARK: - 后台服务
 

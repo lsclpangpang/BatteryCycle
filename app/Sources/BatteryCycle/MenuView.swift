@@ -43,6 +43,10 @@ struct MenuView: View {
             ))
 
             SwitchRow(title: "保持屏幕常亮", isOn: $model.keepDisplayOn)
+            if model.keepDisplayOn {
+                ThresholdSlider(title: "无操作多久后锁屏", value: $model.lockAfterMinutes,
+                                range: BatteryModel.lockRange, unit: " 分钟") {}
+            }
 
             SwitchRow(title: "到达上下限时通知", isOn: $model.notifyThresholds)
 
@@ -254,6 +258,7 @@ struct ThresholdSlider: View {
     let title: String
     @Binding var value: Int
     let range: ClosedRange<Int>
+    var unit = "%"
     let onCommit: () -> Void
 
     var body: some View {
@@ -261,7 +266,7 @@ struct ThresholdSlider: View {
             HStack {
                 Text(title)
                 Spacer()
-                Text("\(value)%")
+                Text("\(value)\(unit)")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
