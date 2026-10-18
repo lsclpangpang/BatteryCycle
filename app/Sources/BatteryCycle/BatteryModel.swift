@@ -94,6 +94,8 @@ final class BatteryModel: ObservableObject {
     private var displayAssertion = IOPMAssertionID(kIOPMNullAssertionID)
     /// 这一段无操作期间已经锁过屏，有操作后才再次计时
     private var lockedForIdle = false
+    /// 最近一次看到别的程序（如正在放视频的播放器、浏览器）要求屏幕常亮的时间
+    private var othersKeptDisplayOnAt: Date?
     /// 开始「接着电源但没在充电」的时间，见 pluggedNotCharging
     private var notChargingSince: Date?
     /// 上一次读到的有效状态，和新状态比较得出要通知的事件
@@ -443,7 +445,14 @@ final class BatteryModel: ObservableObject {
     private func lockIfIdle() {
         guard keepDisplayOn else { return }
         // ~0 即 kCGAnyInputEventType：键盘、鼠标、触控板任一操作
-        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+        var idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+        // 和系统一样：别的程序要求屏幕常亮（在放视频）时不锁，停止后再从头计时
+        if Self.otherProcessKeepsDisplayOn() {
+            othersKeptDisplayOnAt = Date()
+        }
+        if let at = othersKeptDisplayOnAt {
+            idle = min(idle, Date().timeIntervalSince(at))
+        }
         guard idle >= Double(lockAfterMinutes * 60) else {
             lockedForIdle = false
             return
@@ -456,6 +465,26 @@ final class BatteryModel: ObservableObject {
         } else {
             message = "无法自动锁屏"
         }
+    }
+
+    /// 其他进程持有阻止熄屏的断言，自己的不算
+    private static func otherProcessKeepsDisplayOn() -> Bool {
+        var unmanaged: Unmanaged<CFDictionary>?
+        guard IOPMCopyAssertionsByProcess(&unmanaged) == kIOReturnSuccess,
+              let byPid = unmanaged?.takeRetainedValue() as NSDictionary?
+        else { return false }
+        let me = Int(getpid())
+        let types: Set<String> = ["PreventUserIdleDisplaySleep", "NoDisplaySleepAssertion"]
+        for (key, value) in byPid {
+            guard let pid = key as? NSNumber, pid.intValue != me, let list = value as? [[String: Any]] else { continue }
+            for assertion in list {
+                if let type = assertion["AssertType"] as? String, types.contains(type),
+                   (assertion["AssertLevel"] as? Int ?? 0) != 0 {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     private static func screenIsLocked() -> Bool {
