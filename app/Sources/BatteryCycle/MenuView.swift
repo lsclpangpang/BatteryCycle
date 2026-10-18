@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MenuView: View {
     @EnvironmentObject var model: BatteryModel
+    @EnvironmentObject var displays: DisplayController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -48,6 +49,11 @@ struct MenuView: View {
                                 range: BatteryModel.lockRange, step: 1, unit: " 分钟") {}
             }
 
+            SwitchRow(title: "管理外接显示器", isOn: $displays.manageDisplays)
+            if displays.manageDisplays {
+                ExternalDisplayList()
+            }
+
             SwitchRow(title: "到达上下限时通知", isOn: $model.notifyThresholds)
 
             if let notice = model.notice {
@@ -70,6 +76,7 @@ struct MenuView: View {
             model.loadConfig()
             model.refresh()
             model.checkDaemonVersion()
+            displays.reload()
         }
     }
 
@@ -234,6 +241,33 @@ struct FullChargeRow: View {
             }
         }
         .onDisappear { confirming = false }
+    }
+}
+
+/// 每台外接显示器一个开关，关掉就断开（不再输出画面）
+struct ExternalDisplayList: View {
+    @EnvironmentObject var displays: DisplayController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if displays.displays.isEmpty {
+                Text("没有检测到外接显示器")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(displays.displays) { display in
+                SwitchRow(title: display.name, isOn: Binding(
+                    get: { display.enabled },
+                    set: { displays.setEnabled(display, $0) }
+                ))
+            }
+            if let message = displays.message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(.leading, 12)
     }
 }
 
