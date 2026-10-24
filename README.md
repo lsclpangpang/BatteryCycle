@@ -17,6 +17,10 @@
 
 菜单栏常驻图标显示当前电量，点击后可以查看电池健康度和充电循环次数、开关循环、调整上下限。
 
+电池健康信息下方显示内置插口的连接状态：MagSafe 在最前，USB-C 按物理位置显示（左上、左下、右侧），HDMI 在最后。只列出系统能识别的插口；无法读取状态时显示「未知」，不把它当作未连接。「已连接」仅代表插口连接，不代表正在供电或给电池充电。
+
+插口状态在收到系统事件时刷新，并每秒检查一次兜底；打开面板、唤醒时立即请求刷新。系统驱动上报和调度可能带来额外延迟，1 秒是检查间隔而非端到端延迟保证。位置与状态依赖 macOS 驱动属性，缺少位置时使用端口编号，不猜左右。
+
 适用于 Apple Silicon（M 系列）Mac，需要 macOS 13 或更高版本。
 
 ## 下载安装
@@ -46,6 +50,13 @@
 xcode-select --install
 make            # 生成 app/build/BatteryCycle.app
 make install    # 复制到「应用程序」并打开
+```
+
+端口采集和刷新检查（只需 Command Line Tools）：
+
+```sh
+sh app/test-ports.sh
+BATTERYCYCLE_TEST_LIVE_PORTS=1 sh app/test-ports.sh # 另输出本机只读快照及采集耗时
 ```
 
 推送到 `main` 会自动构建；推送 `v*` 标签（如 `git tag v1.0.1 && git push --tags`）会发布 Release。

@@ -52,6 +52,7 @@ final class BatteryModel: ObservableObject {
     /// 中间这段不能算；所以从充电变过来的要持续几秒才算，原本就没在充（刚插上）的立即算
     @Published var pluggedNotCharging = false
     @Published var health: BatteryHealth?
+    @Published private(set) var ports: [PortStatus] = []
     @Published var status: DaemonStatus?
     @Published var enabled = true
     @Published var low = 10
@@ -98,6 +99,7 @@ final class BatteryModel: ObservableObject {
     private var othersKeptDisplayOnAt: Date?
     /// 开始「接着电源但没在充电」的时间，见 pluggedNotCharging
     private var notChargingSince: Date?
+    private var portMonitor: PortMonitor?
     /// 上一次读到的有效状态，和新状态比较得出要通知的事件
     private var lastFresh: DaemonStatus?
     private var offlineSince: Date?
@@ -121,9 +123,18 @@ final class BatteryModel: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+        let portMonitor = PortMonitor { [weak self] ports in
+            self?.update(\.ports, ports)
+        }
+        self.portMonitor = portMonitor
+        portMonitor.start()
     }
 
     // MARK: - 读取
+
+    func refreshPorts() {
+        portMonitor?.requestRefresh()
+    }
 
     func refresh() {
         if let battery = Self.readBattery() {
@@ -219,6 +230,9 @@ final class BatteryModel: ObservableObject {
         if let h = health {
             lines.append("电池健康 \(h.percent)%，充电循环 \(h.cycles) 次")
         }
+        lines.append("插口连接：" + (ports.isEmpty ? "暂不可用" : ports.map {
+            "\($0.label)：\($0.connection.title)"
+        }.joined(separator: "，")))
         lines += ["", "== \(Self.statusURL.path) ==", Self.readText(Self.statusURL.path)]
         lines += ["== \(Self.configURL.path) ==", Self.readText(Self.configURL.path)]
         if FileManager.default.fileExists(atPath: Self.fullChargeURL.path) {
