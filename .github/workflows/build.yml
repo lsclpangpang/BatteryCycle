@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check port detection and refresh
+        run: sh ./app/test-ports.sh
+
       - name: Build BatteryCycle.app
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then

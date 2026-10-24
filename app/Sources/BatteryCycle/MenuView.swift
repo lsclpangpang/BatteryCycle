@@ -8,9 +8,7 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 14) {
             header
             LevelBar(pct: model.pct ?? 0, low: model.low, high: model.high, tint: model.tint)
-            if let health = model.health {
-                HealthRow(health: health)
-            }
+            HardwareSummaryView(health: model.health, ports: model.ports)
             // 只在放电阶段显示：这时它就是「从什么时候开始用电池」
             if model.phase == .discharge, let reached = model.reachedText {
                 Label(reached, systemImage: "clock")
@@ -75,6 +73,7 @@ struct MenuView: View {
         .onAppear {
             model.loadConfig()
             model.refresh()
+            model.refreshPorts()
             model.checkDaemonVersion()
             displays.reload()
         }

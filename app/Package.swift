@@ -6,5 +6,6 @@ let package = Package(
     platforms: [.macOS(.v13)],
     targets: [
         .executableTarget(name: "BatteryCycle", path: "Sources/BatteryCycle"),
+        .testTarget(name: "BatteryCycleTests", dependencies: ["BatteryCycle"]),
     ]
 )
