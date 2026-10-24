@@ -4,11 +4,22 @@ import SwiftUI
 struct HardwareSummaryView: View {
     let health: BatteryHealth?
     let ports: [PortStatus]
+    var reachedText: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if let health {
-                HealthRow(health: health)
+            if health != nil || reachedText != nil {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let health {
+                        HealthRow(health: health)
+                    }
+                    if let reachedText {
+                        Label(reachedText, systemImage: "clock")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
                 Divider()
             }
             if ports.isEmpty {

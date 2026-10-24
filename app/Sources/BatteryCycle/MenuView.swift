@@ -8,14 +8,12 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 14) {
             header
             LevelBar(pct: model.pct ?? 0, low: model.low, high: model.high, tint: model.tint)
-            HardwareSummaryView(health: model.health, ports: model.ports)
             // 只在放电阶段显示：这时它就是「从什么时候开始用电池」
-            if model.phase == .discharge, let reached = model.reachedText {
-                Label(reached, systemImage: "clock")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
+            HardwareSummaryView(
+                health: model.health,
+                ports: model.ports,
+                reachedText: model.phase == .discharge ? model.reachedText : nil
+            )
 
             Divider()
 
