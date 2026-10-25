@@ -19,8 +19,8 @@ func XCTAssertEqual<T: Equatable>(_ left: T, _ right: T, _ message: String = "")
 func XCTAssertNotEqual<T: Equatable>(_ left: T, _ right: T) {
     if left == right { failures += 1; print("FAIL: unexpected equal values \(left)") }
 }
-func XCTAssertNil<T>(_ value: T?) {
-    if value != nil { failures += 1; print("FAIL: expected nil") }
+func XCTAssertNil<T>(_ value: T?, _ message: String = "") {
+    if value != nil { failures += 1; print("FAIL: expected nil \(message)") }
 }
 func XCTAssertFalse(_ value: Bool, _ message: String = "") { XCTAssertEqual(value, false, message) }
 
@@ -35,8 +35,9 @@ struct PortReaderTestRunner {
         try tests.testNoPhysicalLocationIsInventedFromPortNumber()
         tests.testExternalPortsAndUnrelatedPortKindsAreExcluded()
         try tests.testMissingNumberUsesRegistryIdentityWithoutCollapsingPorts()
+        try tests.testInvalidPortNumbersNeverAliasAnotherConnector()
         do { try tests.testLiveSnapshotWhenRequested() } catch is XCTSkip {}
-        print("PortReader: 7 checks, \(failures) failures")
+        print("PortReader: 8 checks, \(failures) failures")
         if failures > 0 { exit(1) }
     }
 }
@@ -136,5 +137,16 @@ final class PortReaderTests: XCTestCase {
         XCTAssertFalse(ports.isEmpty, "This diagnostic expects a supported machine with built-in ports")
         print("PORT_READ milliseconds min=\(timings.min()!) avg=\(timings.reduce(0, +) / Double(timings.count)) max=\(timings.max()!)")
         for port in ports { print("PORT_SNAPSHOT \(port.id) \(port.label) \(port.connection.title)") }
+    }
+
+    func testInvalidPortNumbersNeverAliasAnotherConnector() throws {
+        let invalid: [Any] = [1.9, Double.nan, Double.infinity, 0, -1, 256, UInt64.max, true]
+        for number in invalid {
+            var data = properties()
+            data["PortNumber"] = number
+            let port = try XCTUnwrap(PortReader.decode(properties: data, registryID: 77, location: nil, ccActive: nil))
+            XCTAssertEqual(port.id, "usbC:registry-77")
+            XCTAssertEqual(port.label, "USB-C")
+        }
     }
 }

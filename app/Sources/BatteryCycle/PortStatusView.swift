@@ -33,6 +33,7 @@ struct HardwareSummaryView: View {
                 ) {
                     ForEach(ports) { port in
                         PortStatusCell(port: port)
+                            .padding(.vertical, 5)
                     }
                 }
             }

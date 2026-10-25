@@ -3,11 +3,64 @@ import SwiftUI
 struct MenuView: View {
     @EnvironmentObject var model: BatteryModel
     @EnvironmentObject var displays: DisplayController
+    @State private var powerExpanded = false
+    @State private var isVisible = false
+    @State private var sizing = MenuSizing()
+    @State private var powerFrame: CGRect = .zero
 
     var body: some View {
+        ScrollView(.vertical) {
+            content
+                .fixedSize(horizontal: false, vertical: true)
+                .background(GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { sizing.measureContent(geometry.size.height) }
+                        .onChange(of: geometry.size.height) { sizing.measureContent($0) }
+                })
+        }
+        .frame(width: 300, height: viewportHeight)
+        .coordinateSpace(name: "menuViewport")
+        .onPreferenceChange(PowerFlowFrame.self) { powerFrame = $0 }
+        .onAppear {
+            isVisible = true
+            updateScreenHeight()
+            model.loadConfig()
+            model.refresh()
+            model.refreshPorts()
+            model.checkDaemonVersion()
+            displays.reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
+            if isVisible { updateScreenHeight(preferWindow: true) }
+        }
+        .onDisappear {
+            isVisible = false
+            powerExpanded = false
+            powerFrame = .zero
+        }
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 14) {
-            header
+            Button {
+                powerFrame = .zero
+                powerExpanded.toggle()
+                model.refreshPorts()
+            } label: {
+                header
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(model.percentText)，\(model.title)，电力流向")
+            .accessibilityValue(powerExpanded ? "已展开" : "已收起")
+            .help("点击展开或收起电力流向")
             LevelBar(pct: model.pct ?? 0, low: model.low, high: model.high, tint: model.tint)
+            if powerExpanded {
+                PowerFlowView(telemetry: model.power, ports: model.ports, animationsEnabled: powerIsVisible)
+                    .background(GeometryReader { geometry in
+                        Color.clear.preference(key: PowerFlowFrame.self, value: geometry.frame(in: .named("menuViewport")))
+                    })
+            }
             // 只在放电阶段显示：这时它就是「从什么时候开始用电池」
             HardwareSummaryView(
                 health: model.health,
@@ -68,13 +121,20 @@ struct MenuView: View {
         }
         .padding(16)
         .frame(width: 300)
-        .onAppear {
-            model.loadConfig()
-            model.refresh()
-            model.refreshPorts()
-            model.checkDaemonVersion()
-            displays.reload()
-        }
+    }
+
+    private var powerIsVisible: Bool {
+        PowerFlowAnimationVisibility.isVisible(menuVisible: isVisible, frame: powerFrame,
+                                               viewportHeight: viewportHeight)
+    }
+
+    private var viewportHeight: CGFloat { sizing.viewportHeight }
+
+    private func updateScreenHeight(preferWindow: Bool = false) {
+        let screen = (preferWindow ? NSApp.keyWindow?.screen : nil)
+            ?? NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
+            ?? NSScreen.main
+        if let screen { sizing.updateScreenHeight(screen.visibleFrame.height) }
     }
 
     private var header: some View {
@@ -91,6 +151,10 @@ struct MenuView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            Spacer(minLength: 0)
+            Image(systemName: powerExpanded ? "chevron.up" : "chevron.down")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -143,6 +207,14 @@ struct MenuView: View {
                 .fixedSize()
             }
         }
+    }
+}
+
+private struct PowerFlowFrame: PreferenceKey {
+    static var defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let next = nextValue()
+        if PowerFlowAnimationVisibility.hasMeasurement(next) { value = next }
     }
 }
 
