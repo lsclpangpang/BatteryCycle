@@ -19,6 +19,17 @@ jobs:
       - name: Check port detection and refresh
         run: sh ./app/test-ports.sh
 
+      - name: Check power readings and flow presentation
+        run: |
+          sh ./app/test-power.sh
+          sh ./app/test-power-view.sh
+
+      - name: Check adaptive menu sizing
+        run: sh ./app/test-menu-sizing.sh
+
+      - name: Check battery reading boundaries
+        run: sh ./app/test-battery-readings.sh
+
       - name: Build BatteryCycle.app
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then

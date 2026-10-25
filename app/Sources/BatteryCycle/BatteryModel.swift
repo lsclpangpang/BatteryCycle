@@ -53,6 +53,7 @@ final class BatteryModel: ObservableObject {
     @Published var pluggedNotCharging = false
     @Published var health: BatteryHealth?
     @Published private(set) var ports: [PortStatus] = []
+    @Published private(set) var power = PowerTelemetry.unavailable
     @Published var status: DaemonStatus?
     @Published var enabled = true
     @Published var low = 10
@@ -123,7 +124,10 @@ final class BatteryModel: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
-        let portMonitor = PortMonitor { [weak self] ports in
+        let portMonitor = PortMonitor(powerReader: { PowerTelemetryReader.read() },
+                                      onPowerChange: { [weak self] power in
+            self?.update(\.power, power)
+        }) { [weak self] ports in
             self?.update(\.ports, ports)
         }
         self.portMonitor = portMonitor
@@ -155,13 +159,16 @@ final class BatteryModel: ObservableObject {
         update(\.daemonInstalled, FileManager.default.fileExists(atPath: Self.daemonPlistPath))
         update(\.fullChargeRequested, FileManager.default.fileExists(atPath: Self.fullChargeURL.path))
         do {
-            let data = try Data(contentsOf: Self.statusURL)
+            let data = try BatteryReadings.readSmallFile(at: Self.statusURL)
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             let s = try decoder.decode(DaemonStatus.self, from: data)
             update(\.status, s)
-            let age = Int(Date().timeIntervalSince1970 - s.updated)
-            update(\.statusProblem, age < 90 ? nil : "状态已 \(age) 秒没有更新")
+            if let age = BatteryReadings.elapsedSeconds(since: s.updated, now: Date().timeIntervalSince1970) {
+                update(\.statusProblem, age < 90 ? nil : "状态已 \(age) 秒没有更新")
+            } else {
+                update(\.statusProblem, "服务状态的时间无效")
+            }
         } catch let error as DecodingError {
             update(\.status, nil)
             update(\.statusProblem, "状态文件无法解析：\(error)")
@@ -238,7 +245,7 @@ final class BatteryModel: ObservableObject {
         if FileManager.default.fileExists(atPath: Self.fullChargeURL.path) {
             lines.append("（存在充满请求 \(Self.fullChargeURL.lastPathComponent)）")
         }
-        lines += ["== \(Self.logPath) 最近内容 ==", Self.readTail(Self.logPath, bytes: 6000)]
+        lines += ["== \(Self.logPath) 最近内容 ==", Self.readTail(Self.logPath)]
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
@@ -248,18 +255,22 @@ final class BatteryModel: ObservableObject {
     static let logPath = "/var/log/batteryd.log"
 
     private static func readText(_ path: String) -> String {
-        (try? String(contentsOfFile: path, encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "（读不到）"
+        guard let data = try? BatteryReadings.readSmallFile(at: URL(fileURLWithPath: path)),
+              let text = String(data: data, encoding: .utf8) else { return "（读不到或文件过大）" }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// 日志可能很大，只读末尾，并去掉被截断的第一行
-    private static func readTail(_ path: String, bytes: UInt64) -> String {
+    private static func readTail(_ path: String) -> String {
+        let bytes = 6_000
         guard let handle = FileHandle(forReadingAtPath: path) else { return "（读不到）" }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
-        try? handle.seek(toOffset: size > bytes ? size - bytes : 0)
-        var text = String(decoding: handle.readDataToEndOfFile(), as: UTF8.self)
-        if size > bytes, let newline = text.firstIndex(of: "\n") {
+        try? handle.seek(toOffset: size > UInt64(bytes) ? size - UInt64(bytes) : 0)
+        // Also cap the read itself: the log may grow after seekToEnd().
+        let data = (try? handle.read(upToCount: bytes)) ?? Data()
+        var text = String(decoding: data, as: UTF8.self)
+        if size > UInt64(bytes), let newline = text.firstIndex(of: "\n") {
             text = String(text[text.index(after: newline)...])
         }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -325,9 +336,10 @@ final class BatteryModel: ObservableObject {
             guard let d = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any],
                   d[kIOPSTypeKey] as? String == kIOPSInternalBatteryType,
                   let cur = d[kIOPSCurrentCapacityKey] as? Int,
-                  let max = d[kIOPSMaxCapacityKey] as? Int, max > 0
+                  let max = d[kIOPSMaxCapacityKey] as? Int,
+                  let percent = BatteryReadings.capacityPercent(current: cur, maximum: max)
             else { continue }
-            return (cur * 100 / max,
+            return (percent,
                     d[kIOPSPowerSourceStateKey] as? String == kIOPSACPowerValue,
                     d[kIOPSIsChargingKey] as? Bool ?? false)
         }
@@ -346,9 +358,10 @@ final class BatteryModel: ObservableObject {
         }
         guard let design = int("DesignCapacity"), design > 0,
               let full = int("AppleRawMaxCapacity") ?? int("NominalChargeCapacity"),
-              let cycles = int("CycleCount")
+              let cycles = int("CycleCount"), cycles >= 0,
+              let percent = BatteryReadings.healthPercent(full: full, design: design)
         else { return nil }
-        return BatteryHealth(percent: Int((Double(full) * 100 / Double(design)).rounded()), cycles: cycles)
+        return BatteryHealth(percent: percent, cycles: cycles)
     }
 
     // MARK: - 设置
@@ -356,7 +369,8 @@ final class BatteryModel: ObservableObject {
     /// 校验规则和服务相同：区间超出范围时服务沿用之前的设置，这里也不显示文件里的值，
     /// 改为显示服务实际在用的区间
     func loadConfig() {
-        guard let text = try? String(contentsOf: Self.configURL, encoding: .utf8) else { return }
+        guard let data = try? BatteryReadings.readSmallFile(at: Self.configURL),
+              let text = String(data: data, encoding: .utf8) else { return }
         var l = low, h = high
         for line in text.split(separator: "\n") {
             let parts = line.split(separator: "=", maxSplits: 1)
@@ -371,7 +385,7 @@ final class BatteryModel: ObservableObject {
         if Self.lowRange.contains(l) && Self.highRange.contains(h) {
             low = l
             high = h
-        } else if let s = status {
+        } else if let s = status, Self.lowRange.contains(s.low), Self.highRange.contains(s.high) {
             low = s.low
             high = s.high
         }

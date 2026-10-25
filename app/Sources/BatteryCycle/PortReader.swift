@@ -184,8 +184,11 @@ enum PortReader {
     }
 
     private static func portNumber(_ value: Any?) -> Int? {
-        guard let value = value as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
-              value.intValue > 0 else { return nil }
-        return value.intValue
+        guard let value = value as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() else { return nil }
+        let number = value.doubleValue
+        // Never truncate a fractional identifier or wrap an oversized number.
+        // Unknown numbering falls back to the registry ID without assuming a side.
+        guard number.isFinite, number.rounded() == number, (1...255).contains(number) else { return nil }
+        return Int(number)
     }
 }
