@@ -3,6 +3,7 @@ import SwiftUI
 struct MenuView: View {
     @EnvironmentObject var model: BatteryModel
     @EnvironmentObject var displays: DisplayController
+    @EnvironmentObject var brightness: BrightnessController
     @State private var powerExpanded = false
     @State private var isVisible = false
     @State private var sizing = MenuSizing()
@@ -96,6 +97,38 @@ struct MenuView: View {
             if model.keepDisplayOn {
                 ThresholdSlider(title: "无操作多久后锁屏", value: $model.lockAfterMinutes,
                                 range: BatteryModel.lockRange, step: 1, unit: " 分钟") {}
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                SwitchRow(title: "屏幕亮度降到最低", isOn: Binding(
+                    get: { brightness.isEnabled },
+                    set: { brightness.setEnabled($0) }
+                ))
+                .disabled(brightness.needsRecovery)
+                Text(brightness.isEnabled
+                     ? "自动亮度已暂停；直接按亮度加减键即可退出并调节"
+                     : "仅调整内置屏幕；支持亮度按键直接调节")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if brightness.needsKeyboardPermission {
+                    Button("允许亮度键调节") { brightness.requestKeyboardPermission() }
+                        .font(.caption)
+                    Text("首次使用需允许“输入监控”，仅用于识别亮度功能键")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let message = brightness.message {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if brightness.needsRecovery {
+                    Button("重试恢复屏幕设置") { brightness.recover() }
+                        .font(.caption)
+                }
             }
 
             SwitchRow(title: "管理外接显示器", isOn: $displays.manageDisplays)
@@ -350,6 +383,7 @@ struct SwitchRow: View {
             Spacer()
             Toggle("", isOn: $isOn)
                 .labelsHidden()
+                .accessibilityLabel(title)
                 .toggleStyle(.switch)
                 .controlSize(.small)
         }
