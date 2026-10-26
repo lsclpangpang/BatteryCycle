@@ -7,6 +7,7 @@
 #include <IOKit/IOMessage.h>
 #include <IOKit/ps/IOPSKeys.h>
 #include <IOKit/ps/IOPowerSources.h>
+#include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
@@ -21,12 +22,24 @@
 #include <unistd.h>
 #include "smc.h"
 
+#ifndef CONFIG_DIR
 #define CONFIG_DIR   "/Library/Application Support/batteryd"
+#endif
+#ifndef CONFIG_FILE
 #define CONFIG_FILE  CONFIG_DIR "/config"
+#endif
+#ifndef STATE_FILE
 #define STATE_FILE   "/var/db/batteryd.state"
+#endif
+#ifndef STATUS_FILE
 #define STATUS_FILE  "/var/run/batteryd.json"
+#endif
+#ifndef FULL_FILE
 #define FULL_FILE    CONFIG_DIR "/fullcharge"
+#endif
+#ifndef REACHED_FILE
 #define REACHED_FILE "/var/db/batteryd.reached"
+#endif
 #define POLL_SECONDS 30
 #define FULL_EXPIRE_SECONDS (12 * 3600)  // 充满请求超过这么久还没完成就作废
 // 区间的合法范围，和 App 滑块的范围一致（BatteryModel.lowRange / highRange）
@@ -41,6 +54,8 @@ static bool enabled = true;
 static int low = 10, high = 75;
 static Mode mode;
 static bool full_charge;  // 正在一次性充满到 100%
+// WillSleep 后一直保持，直到完整唤醒。DarkWake 的定时器/电源事件不能恢复循环充电。
+static bool system_sleeping = true;
 static long reached_at;   // 上次充到上限（或充满）的时间，0 表示还没有
 static int reached_pct;   // 当时的上限值，充满时为 100
 static bool has_chte, has_chie;  // 新固件（macOS 15+）的 key
@@ -113,6 +128,25 @@ static bool adapter_connected(bool on_ac) {
     return watts > 0;
 }
 
+// 服务可能在 DarkWake 中重启，此时不会补发 WillSleep。读取系统能力初始化，
+// 不使用屏幕亮灭或合盖状态，以免影响关屏工作和合盖外接显示器。
+// Graphics/Audio 的判定与 Apple powerd 的 PMConnection_prime 一致。
+static void initialize_sleep_state(void) {
+    system_sleeping = true;
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
+    CFTypeRef value = svc ? IORegistryEntryCreateCFProperty(svc, CFSTR("System Capabilities"),
+                                                           kCFAllocatorDefault, 0) : NULL;
+    int capabilities = 0;
+    bool known = value && CFGetTypeID(value) == CFNumberGetTypeID()
+                 && CFNumberGetValue(value, kCFNumberIntType, &capabilities);
+    if (known)
+        system_sleeping = !(capabilities & (kIOPMSystemCapabilityGraphics | kIOPMSystemCapabilityAudio));
+    else
+        logf_("警告：无法读取系统睡眠状态，循环充电暂停至完整唤醒");
+    if (value) CFRelease(value);
+    if (svc) IOObjectRelease(svc);
+}
+
 // ---------- SMC 控制 ----------
 
 // 写入失败时把第一个失败的 key 记进 fault，供状态文件和日志使用
@@ -175,11 +209,18 @@ static void apply(Mode m) {
     report_fault();
 }
 
+// 睡眠时让适配器供电并暂停充电。不能用 MODE_DISCHARGE，否则仍会切断外接供电。
+// 两步都尝试；失败沿用默认供电回退，并通过 fault 告知限充未能生效。
+static void apply_sleep(void) {
+    fault[0] = 0;
+    bool ok = set_adapter(true);
+    if (!set_charging(false) || !ok) write_defaults();
+}
+
 // ---------- 阻止自动睡眠 ----------
 
-// 睡眠期间进程不运行，到了上下限也没法切换（充电阶段会越过上限）。
-// 接着电源、且循环启用或正在充满时阻止空闲自动睡眠；屏幕照常关闭，合盖仍会睡眠。
-// 只用电池时照常睡眠，省电（睡眠中放电阶段电量停在当前值，不会越过下限）
+// 清醒且接着电源时维持循环；合盖仍允许睡眠，睡眠中暂停普通循环充电。
+// DarkWake 不重新申请防睡眠，避免后台维护唤醒又启动循环。
 static void keep_awake(bool on, const char *why) {
     if (on == (awake_assertion != kIOPMNullAssertionID)) return;
     if (!on) {
@@ -236,9 +277,9 @@ static void write_status(int pct, bool on_ac) {
     FILE *f = fopen(STATUS_FILE ".tmp", "w");
     if (!f) return;
     fprintf(f, "{\"pct\":%d,\"ac\":%s,\"phase\":\"%s\",\"enabled\":%s,\"low\":%d,\"high\":%d,\"updated\":%ld,"
-               "\"reached_at\":%ld,\"reached_pct\":%d,\"fault\":\"%s\",\"keys\":\"%s %s\"}\n",
+               "\"reached_at\":%ld,\"reached_pct\":%d,\"sleep_paused\":%s,\"fault\":\"%s\",\"keys\":\"%s %s\"}\n",
             pct, on_ac ? "true" : "false", phase, enabled ? "true" : "false", low, high, (long)time(NULL),
-            reached_at, reached_pct, fault,
+            reached_at, reached_pct, system_sleeping && enabled && !full_charge ? "true" : "false", fault,
             has_chte ? "CHTE" : "CH0B/CH0C", has_chie ? "CHIE" : "CH0I");
     fclose(f);
     rename(STATUS_FILE ".tmp", STATUS_FILE);
@@ -309,15 +350,8 @@ static void tick(void) {
     bool on_ac = false;
     int pct = battery_percent(&on_ac);
     bool active = enabled || want_full;
-    keep_awake(active && adapter_connected(on_ac), active ? "未接电源" : "循环已暂停");
-    if (pct < 0) {
-        // 照常写状态，App 马上能看到原因，而不是等状态过期
-        snprintf(fault, sizeof fault, "读取电量失败");
-        report_fault();
-        write_status(pct, on_ac);
-        return;
-    }
-
+    keep_awake(!system_sleeping && active && adapter_connected(on_ac),
+               system_sleeping ? "系统睡眠" : active ? "未接电源" : "循环已暂停");
     if (want_full && pct >= 100) {
         unlink(FULL_FILE);
         want_full = false;
@@ -333,9 +367,24 @@ static void tick(void) {
         mode = pct >= high ? MODE_DISCHARGE : MODE_CHARGE;
         save_state();
         if (mode == MODE_DISCHARGE) save_reached(pct);
-        logf_("已取消充满（电量 %d%%），恢复循环", pct);
+        if (pct >= 0) logf_("已取消充满（电量 %d%%），恢复循环", pct);
+        else logf_("已取消充满，等待电量读数后恢复循环");
     }
     full_charge = want_full;
+    if (pct < 0) {
+        // 请求取消/过期即使没有电量读数也要生效，再落实睡眠保护。
+        fault[0] = 0;
+        if (system_sleeping) {
+            if (enabled && !full_charge) apply_sleep();
+            // 暂停循环或显式充满也必须恢复适配器，不能把放电阶段的断电状态带入睡眠。
+            else write_defaults();
+        }
+        // 在最终故障确定后只报告一次，避免每次重试交替报告恢复和读数失败。
+        if (!fault[0]) snprintf(fault, sizeof fault, "读取电量失败");
+        report_fault();
+        write_status(pct, on_ac);
+        return;
+    }
     if (full_charge) {
         apply(MODE_CHARGE);
         write_status(pct, on_ac);
@@ -348,13 +397,22 @@ static void tick(void) {
         return;
     }
 
+    // 不改变已保存的循环阶段。包括低电量 DarkWake、配置变化和定时器在内的
+    // 所有入口都必须经过这里，完整唤醒后才根据电量恢复正常循环。
+    if (system_sleeping) {
+        apply_sleep();
+        report_fault();
+        write_status(pct, on_ac);
+        return;
+    }
+
     Mode next = mode;
     if (pct <= low)  next = MODE_CHARGE;
     if (pct >= high) next = MODE_DISCHARGE;
     if (next != mode) {
         mode = next;
         save_state();
-        if (mode == MODE_DISCHARGE) save_reached(high);
+        if (mode == MODE_DISCHARGE) save_reached(pct);
         logf_("电量 %d%%，切换到 %s", pct, mode == MODE_CHARGE ? "充电" : "放电");
     }
     // 每次都重新写入：睡眠/唤醒或系统可能会重置这些 key
@@ -369,14 +427,13 @@ static void power_cb(void *ref, io_service_t svc, natural_t msg, void *arg) {
         IOAllowPowerChange(pm_root, (long)arg);
         break;
     case kIOMessageSystemWillSleep:
-        // 睡眠期间进程不运行，恢复适配器供电，避免睡眠中电池被放空；
-        // 放电阶段仍保持不充电，电量停在当前值。
-        // 记下睡眠和唤醒时的电量：充电阶段睡眠时没法在上限处停下，日志里能看出越过了多少
+        system_sleeping = true;
         logf_("睡眠，电量 %d%%", battery_percent(NULL));
-        set_adapter(true);
+        tick();
         IOAllowPowerChange(pm_root, (long)arg);
         break;
     case kIOMessageSystemHasPoweredOn:
+        system_sleeping = false;
         logf_("唤醒，电量 %d%%", battery_percent(NULL));
         tick();
         break;
@@ -443,8 +500,12 @@ static int run(void) {
     watch_power_source(kIOPSNotifyAnyPowerSource);
 
     pm_root = IORegisterForSystemPower(NULL, &pm_port, power_cb, &pm_notifier);
-    if (pm_root) IONotificationPortSetDispatchQueue(pm_port, dispatch_get_main_queue());
-    else logf_("警告：无法注册睡眠通知");
+    if (pm_root) {
+        initialize_sleep_state();
+        IONotificationPortSetDispatchQueue(pm_port, dispatch_get_main_queue());
+    } else {
+        logf_("警告：无法注册睡眠通知，循环充电暂停以避免睡眠越限");
+    }
 
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0),
