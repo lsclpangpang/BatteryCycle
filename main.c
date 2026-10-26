@@ -374,7 +374,11 @@ static void tick(void) {
     if (pct < 0) {
         // 请求取消/过期即使没有电量读数也要生效，再落实睡眠保护。
         fault[0] = 0;
-        if (system_sleeping && enabled && !full_charge) apply_sleep();
+        if (system_sleeping) {
+            if (enabled && !full_charge) apply_sleep();
+            // 暂停循环或显式充满也必须恢复适配器，不能把放电阶段的断电状态带入睡眠。
+            else write_defaults();
+        }
         // 在最终故障确定后只报告一次，避免每次重试交替报告恢复和读数失败。
         if (!fault[0]) snprintf(fault, sizeof fault, "读取电量失败");
         report_fault();

@@ -306,6 +306,50 @@ static void test_unknown_battery_does_not_bypass_sleep(void) {
     assert_sleep_hold();
 }
 
+static void test_unknown_battery_paused_at_sleep(void) {
+    reset_case();
+    mode = MODE_DISCHARGE;
+    tick();
+    assert(!fake_adapter && !fake_charging);
+    fake_pct = -1;
+    write_config(false);
+    sleep_now();
+    assert(!enabled && fake_adapter && fake_charging);
+    assert(strstr(fault, "读取电量失败"));
+    assert_status_contains("\"phase\":\"paused\"");
+    assert_status_contains("\"sleep_paused\":false");
+    fake_pct = 50;
+    tick();
+    assert(!enabled && fake_adapter && fake_charging && !fault[0]);
+    write_config(true);
+    tick();
+    assert_sleep_hold();
+    wake_now();
+    assert(mode == MODE_DISCHARGE && !fake_adapter && !fake_charging);
+}
+
+static void test_unknown_battery_full_at_sleep(void) {
+    reset_case();
+    mode = MODE_DISCHARGE;
+    tick();
+    assert(!fake_adapter && !fake_charging);
+    fake_pct = -1;
+    request_full();
+    sleep_now();
+    assert(full_charge && fake_adapter && fake_charging);
+    assert(strstr(fault, "读取电量失败"));
+    assert_status_contains("\"phase\":\"full\"");
+    assert_status_contains("\"sleep_paused\":false");
+    fake_pct = 50;
+    tick();
+    assert(full_charge && fake_adapter && fake_charging && !fault[0]);
+    fake_pct = 100;
+    tick();
+    assert(!full_charge && access(FULL_FILE, F_OK) != 0);
+    assert(mode == MODE_DISCHARGE && reached_pct == 100);
+    assert_sleep_hold();
+}
+
 static void test_unknown_battery_cancel_full(void) {
     for (int expires = 0; expires < 2; expires++) {
         reset_case();
@@ -422,11 +466,13 @@ int main(void) {
     test_full_expiry_and_completion();
     test_paused_cycle();
     test_unknown_battery_does_not_bypass_sleep();
+    test_unknown_battery_paused_at_sleep();
+    test_unknown_battery_full_at_sleep();
     test_unknown_battery_cancel_full();
     test_original_low_battery_maintenance_wake();
     test_startup_capabilities();
     test_faults_and_legacy_keys();
     test_actual_reached_percentage();
-    puts("batteryd: 11 sleep/charge regression scenarios passed (no hardware writes)");
+    puts("batteryd: 13 sleep/charge regression scenarios passed (no hardware writes)");
     return 0;
 }
