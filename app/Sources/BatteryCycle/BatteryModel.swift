@@ -15,9 +15,11 @@ struct DaemonStatus: Decodable, Equatable {
     let low: Int
     let high: Int
     let updated: TimeInterval
-    /// 上次充到上限的时间（0 表示还没有）和当时的上限值；旧版服务没有这两项
+    /// 上次停止充电的时间（0 表示还没有）和当时的实际电量；旧版服务没有这两项
     let reachedAt: TimeInterval?
     let reachedPct: Int?
+    /// 系统睡眠或后台维护唤醒期间，循环保持适配器供电并暂停充电。
+    let sleepPaused: Bool?
     /// 故障原因（SMC 写入失败、读不到电量），空串表示正常；旧版服务没有这一项
     let fault: String?
 }
@@ -729,6 +731,7 @@ final class BatteryModel: ObservableObject {
     }
 
     var title: String {
+        if isSleepPaused { return "睡眠期间暂停充电" }
         switch phase {
         case .offline: return daemonInstalled ? "后台服务未运行" : "需要安装后台服务"
         case .fault: return "无法控制充电"
@@ -741,6 +744,7 @@ final class BatteryModel: ObservableObject {
     }
 
     var subtitle: String {
+        if isSleepPaused { return "保持外接电源供电，完全唤醒后恢复循环" }
         switch phase {
         case .offline:
             if !daemonInstalled { return "首次使用，点击下方按钮安装，需要输入一次管理员密码" }
@@ -754,6 +758,7 @@ final class BatteryModel: ObservableObject {
     }
 
     var phaseSymbol: String {
+        if isSleepPaused { return "moon.fill" }
         switch phase {
         case .offline: return daemonInstalled ? "exclamationmark.triangle.fill" : "arrow.down.app.fill"
         case .fault: return "exclamationmark.octagon.fill"
@@ -765,6 +770,7 @@ final class BatteryModel: ObservableObject {
     }
 
     var tint: Color {
+        if isSleepPaused { return .secondary }
         switch phase {
         case .offline: return daemonInstalled ? .red : .accentColor
         case .fault: return .red
@@ -772,6 +778,14 @@ final class BatteryModel: ObservableObject {
         case .charge: return .green
         case .discharge: return .orange
         case .full: return .blue
+        }
+    }
+
+    private var isSleepPaused: Bool {
+        guard status?.sleepPaused == true else { return false }
+        switch phase {
+        case .charge, .discharge: return true
+        default: return false
         }
     }
 }
