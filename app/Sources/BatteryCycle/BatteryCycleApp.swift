@@ -4,12 +4,14 @@ import SwiftUI
 struct BatteryCycleApp: App {
     @StateObject private var model = BatteryModel()
     @StateObject private var displays = DisplayController()
+    @StateObject private var brightness = BrightnessController()
 
     var body: some Scene {
         MenuBarExtra {
             MenuView()
                 .environmentObject(model)
                 .environmentObject(displays)
+                .environmentObject(brightness)
         } label: {
             // 合成一张图，避免 SwiftUI 给图标和文字各自加留白
             Image(nsImage: model.menuBarImage)

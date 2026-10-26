@@ -30,6 +30,9 @@ jobs:
       - name: Check battery reading boundaries
         run: sh ./app/test-battery-readings.sh
 
+      - name: Check minimum display brightness and recovery
+        run: sh ./app/test-brightness.sh
+
       - name: Check daemon sleep and charge control
         run: sh ./tests/test-daemon.sh
 
