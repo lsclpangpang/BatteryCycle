@@ -22,12 +22,16 @@ private struct DisplayModel: Codable, Hashable {
 private struct DisabledDisplay: Codable {
     let name: String
     let model: DisplayModel
-    /// 断开后在硬件里确实还能看到这个型号；之后看不到了才算拔掉、从列表隐藏，
+    /// 断开后在硬件里确实还能看到这个型号；之后看不到了才算拔掉（见 hidden），
     /// 这样即使某些系统上断开后硬件信息也消失，也不会把还连着的显示器藏起来。存下来，App 重启后照样能判断
     var confirmedAttached = false
-    /// 断开状态下被拔掉了：插回来时自动恢复，确认过的从列表隐藏。系统会一直记着它是断开的，
+    /// 断开状态下被拔掉了：插回来时自动恢复，能确定的从列表隐藏（见 hidden）。系统会一直记着它是断开的，
     /// 不恢复的话插回来也不亮，删掉记录后就只能注销或重启
     var unplugged = false
+    /// 恢复时系统报这个显示器不存在（参数无效），确定已经拔掉；没确认过硬件信息也可以放心从列表隐藏
+    var absent = false
+    /// 从列表隐藏：拔掉了，并且能确定不是还连着——确认过断开后硬件信息还在，或者系统报不存在
+    var hidden: Bool { unplugged && (confirmedAttached || absent) }
     /// 记录时的开机会话：系统重启后断开状态就没了，上次开机留下的拔掉记录直接丢掉，不用一直查硬件
     var boot: String = DisplayController.bootSession
 
@@ -43,6 +47,7 @@ private struct DisabledDisplay: Codable {
         model = try c.decode(DisplayModel.self, forKey: .model)
         confirmedAttached = try c.decodeIfPresent(Bool.self, forKey: .confirmedAttached) ?? false
         unplugged = try c.decodeIfPresent(Bool.self, forKey: .unplugged) ?? false
+        absent = try c.decodeIfPresent(Bool.self, forKey: .absent) ?? false
         boot = try c.decodeIfPresent(String.self, forKey: .boot) ?? ""
     }
 }
@@ -77,6 +82,8 @@ final class DisplayController: ObservableObject {
     private var disabledAt: [CGDirectDisplayID: Date] = [:]
     /// 恢复失败过一次、又没能判断为拔掉的显示器；再失败就从列表移除
     private var failedEnable: Set<CGDirectDisplayID> = []
+    /// 没确认过硬件信息、试探恢复时其实还连着的显示器（断开后硬件信息会消失的系统）；不再试探，免得反复闪
+    private var probedAttached: Set<CGDirectDisplayID> = []
     /// 插回来自动恢复失败、已经提示过的显示器；同型号几台时会反复标记、重试，只提示一次
     private var restoreFailedNotified: Set<CGDirectDisplayID> = []
     /// 各型号开始「硬件里数量不够」的时间；持续一段时间才算拔掉，避免唤醒等瞬间的抖动
@@ -163,9 +170,8 @@ final class DisplayController: ObservableObject {
         } else {
             shortSince = [:]
         }
-        // 没确认过的拔掉记录照样列出（开关关着）：万一其实还连着，不能没了开关
-        for (id, record) in disabled where !(record.unplugged && record.confirmedAttached)
-            && !list.contains(where: { $0.id == id }) {
+        // 拔掉但没能确定的记录照样列出（开关关着）：万一其实还连着，不能没了开关
+        for (id, record) in disabled where !record.hidden && !list.contains(where: { $0.id == id }) {
             list.append((id, record.name, false))
         }
         list.sort { $0.id < $1.id }
@@ -206,7 +212,7 @@ final class DisplayController: ObservableObject {
             if let error {
                 // 拔线后还没识别出来（比如断开后马上拔线）时点了恢复：显示器不在，恢复必然失败，
                 // 标记拔掉等插回来。删掉记录的话插回来系统仍记着它是断开的，就再也恢复不了了
-                if disabled[display.id]?.unplugged == true || markIfUnplugged(display.id, enableFailed: true) {
+                if markIfUnplugged(display.id, enableError: error) {
                     message = "「\(display.name)」已拔掉，插回来时会自动恢复"
                 } else if failedEnable.insert(display.id).inserted {
                     // 偶尔失败可以再试
@@ -240,13 +246,27 @@ final class DisplayController: ObservableObject {
         disabledAt[id] = nil
         failedEnable.remove(id)
         restoreFailedNotified.remove(id)
+        probedAttached.remove(id)
     }
 
     /// 恢复操作之后：硬件里已经看不到这台（拔线后还没来得及标记），恢复不会生效，
     /// 标记为拔掉、等插回来再恢复，不能删记录。恢复成功时只在确认过断开后硬件信息还在时判断；
-    /// 恢复失败本身就说明显示器多半不在了，硬件信息稳定时没确认过也判断（没确认过的仍留在列表里）
-    private func markIfUnplugged(_ id: CGDirectDisplayID, enableFailed: Bool = false) -> Bool {
-        guard let record = disabled[id], !record.unplugged, record.confirmedAttached || (enableFailed && hardwareSettled),
+    /// 恢复失败本身就说明显示器多半不在了，硬件信息稳定时没确认过也判断；系统报不存在的从列表隐藏。
+    /// 已经标记拔掉的：恢复失败就当仍拔着，返回 true
+    private func markIfUnplugged(_ id: CGDirectDisplayID, enableError: String? = nil) -> Bool {
+        guard let record = disabled[id] else { return false }
+        let gone = enableError == Self.absentError
+        if record.unplugged || gone {
+            // 系统报不存在就是拔掉了，不用再看硬件信息（刚唤醒时硬件信息可能还没跟上）
+            if gone {
+                if !record.unplugged { displayLog.notice("标记拔掉 \(id)（系统报不存在）") }
+                disabled[id]?.unplugged = true
+                disabled[id]?.absent = true
+                failedEnable.remove(id)
+            }
+            return enableError != nil
+        }
+        guard record.confirmedAttached || (enableError != nil && hardwareSettled),
               let attached = Self.attachedModels() else { return false }
         let activeExternals = Self.onlineDisplays().filter {
             CGDisplayIsBuiltin($0) == 0 && CGDisplayIsActive($0) != 0 && disabled[$0] == nil
@@ -265,7 +285,7 @@ final class DisplayController: ObservableObject {
         !systemAsleep && !screensAsleep && Date().timeIntervalSince(wokeAt) > 20
     }
 
-    /// 断开的显示器被拔掉后标记出来，确认过的从列表隐藏。硬件里同型号的显示器数量 = 正在显示的 + 断开的，
+    /// 断开的显示器被拔掉后标记出来，能确定的从列表隐藏。硬件里同型号的显示器数量 = 正在显示的 + 断开的，
     /// 少了并且持续 10 秒以上，就说明有断开的被拔掉了
     private func markUnplugged(attached: [DisplayModel: Int], activeExternals: [CGDirectDisplayID]) {
         let active = Self.countModels(activeExternals)
@@ -281,18 +301,43 @@ final class DisplayController: ObservableObject {
                 }
                 continue
             }
-            guard ids.contains(where: { disabled[$0]?.confirmedAttached == true }) else { continue }
+            // 没确认过硬件信息的也要处理（断开后马上拔线时来不及确认），靠试探恢复的结果判断
+            guard ids.contains(where: { disabled[$0]?.confirmedAttached == true || !probedAttached.contains($0) })
+            else { continue }
             let since = shortSince[model] ?? Date()
             shortSince[model] = since
             guard Date().timeIntervalSince(since) >= 10 else { continue }
             shortSince[model] = nil
-            // 先尝试恢复：万一只是显示器待机让硬件信息暂时消失，或者同型号的几台里分不清拔掉的是哪台，
-            // 还连着的会亮起来，下次刷新时记录作废。真拔掉的恢复不会生效（即使返回成功，系统仍记着它是断开的，
-            // 插回来照样黑屏），所以记录留着、标记为拔掉，等插回来再恢复
+            // 先尝试恢复。确认过的：万一只是显示器待机让硬件信息暂时消失，或者同型号的几台里分不清拔掉的是哪台，
+            // 还连着的会亮起来，下次刷新时记录作废；真拔掉的恢复不会生效，记录留着、标记为拔掉，等插回来再恢复。
+            // 没确认过的（断开后马上拔线，来不及确认）：系统报不存在就确定拔掉了；恢复成功说明其实还连着
+            // （断开后硬件信息会消失的系统），马上再断开，保持用户的选择，之后不再试探它
             for id in ids {
-                displayLog.notice("检测到拔掉 \(id)")
-                _ = configure(id, enabled: true)
+                guard let record = disabled[id] else { continue }
+                if !record.confirmedAttached && probedAttached.contains(id) { continue }
+                displayLog.notice("检测到拔掉 \(id) 确认=\(record.confirmedAttached)")
+                let error = configure(id, enabled: true)
+                if !record.confirmedAttached && error == nil {
+                    disabledAt[id] = Date()
+                    let again = configure(id, enabled: false)
+                    if again == Self.absentError {
+                        // 恢复报成功、再断开却报不存在：其实不在
+                        disabled[id]?.unplugged = true
+                        disabled[id]?.absent = true
+                        failedEnable.remove(id)
+                    } else {
+                        if let again { displayLog.notice("试探后重新断开 \(id) 失败：\(again, privacy: .public)") }
+                        probedAttached.insert(id)
+                    }
+                    continue
+                }
+                if !record.confirmedAttached && error != Self.absentError {
+                    // 说不清的失败：不判断，留在列表里，不再试探
+                    probedAttached.insert(id)
+                    continue
+                }
                 disabled[id]?.unplugged = true
+                if error == Self.absentError { disabled[id]?.absent = true }
                 failedEnable.remove(id)
             }
         }
@@ -321,6 +366,7 @@ final class DisplayController: ObservableObject {
                 displayLog.notice("检测到插回 \(id)，尝试恢复")
                 if configure(id, enabled: true) == nil { anySucceeded = true }
                 disabled[id]?.unplugged = false
+                disabled[id]?.absent = false
                 failedEnable.remove(id)
             }
             if !anySucceeded && !restoreFailedNotified.isSuperset(of: ids) {
@@ -343,14 +389,15 @@ final class DisplayController: ObservableObject {
     private func enableAll() -> Bool {
         var failed: [String] = []
         var maybeUnplugged: [String] = []
-        for (id, record) in disabled where !(record.unplugged && record.confirmedAttached) {
-            if configure(id, enabled: true) == nil {
+        for (id, record) in disabled where !record.hidden {
+            let error = configure(id, enabled: true)
+            if error == nil {
                 // 标记拔掉的即使返回成功也可能没生效，留着；真亮了下次刷新时记录作废
                 if !record.unplugged && !markIfUnplugged(id) { forget(id, "关闭管理时恢复成功") }
-            } else if record.unplugged || markIfUnplugged(id, enableFailed: true) {
-                // 确认过的拔掉记录已隐藏，等插回来恢复；没确认过的还在列表里，算没恢复、保持打开，
+            } else if markIfUnplugged(id, enableError: error) {
+                // 隐藏的等插回来恢复；没能确定拔掉、还在列表里的算没恢复、保持打开，
                 // 否则列表收起后万一其实还连着就没开关了
-                if !record.confirmedAttached { maybeUnplugged.append(record.name) }
+                if disabled[id]?.hidden == false { maybeUnplugged.append(record.name) }
             } else {
                 failed.append(record.name)
             }
@@ -362,6 +409,9 @@ final class DisplayController: ObservableObject {
         }
         return failed.isEmpty && maybeUnplugged.isEmpty
     }
+
+    /// 显示器不存在（已拔掉）时恢复返回的错误：参数无效
+    private static let absentError = "错误 \(CGError.illegalArgument.rawValue)"
 
     /// 只在本次登录期间生效：注销、重启后显示器都会恢复，不会一直黑屏
     private func configure(_ id: CGDirectDisplayID, enabled: Bool) -> String? {
@@ -388,7 +438,7 @@ final class DisplayController: ObservableObject {
         } ?? "查不到"
         let records = disabled.keys.sorted().map { id in
             let r = disabled[id]!
-            return "\(id)[\(r.model.vendor)/\(r.model.product) 确认=\(r.confirmedAttached) 拔掉=\(r.unplugged)]"
+            return "\(id)[\(r.model.vendor)/\(r.model.product) 确认=\(r.confirmedAttached) 拔掉=\(r.unplugged) 不存在=\(r.absent)]"
         }
         let snapshot = "在线外接=\(displays.joined(separator: " ")) 硬件=\(hardware) 记录=\(records.joined(separator: " ")) 可判断=\(hardwareSettled)"
         guard snapshot != lastSnapshot else { return }
