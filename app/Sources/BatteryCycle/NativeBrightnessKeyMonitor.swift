@@ -38,9 +38,15 @@ final class NativeBrightnessKeyMonitor: BrightnessKeyMonitoring {
     var requiresPermission: Bool { !CGPreflightListenEventAccess() }
 
     /// Called only by the permission button. Checking/starting never requests access.
+    /// macOS prompts at most once per app and later requests return silently, so open
+    /// the Input Monitoring pane whenever access is still missing. Requesting first
+    /// also lists the app there.
     func requestPermission() {
         precondition(Thread.isMainThread)
-        _ = CGRequestListenEventAccess()
+        guard !CGRequestListenEventAccess(),
+              let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+        else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @discardableResult

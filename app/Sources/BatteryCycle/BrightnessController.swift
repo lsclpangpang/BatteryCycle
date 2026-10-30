@@ -187,7 +187,9 @@ final class BrightnessController: ObservableObject {
         refreshKeyboardPermission()
     }
 
-    private func refreshKeyboardPermission() {
+    /// Access granted in System Settings takes effect without relaunching; the panel
+    /// rechecks on open so the permission button disappears.
+    func refreshKeyboardPermission() {
         needsKeyboardPermission = keyboard?.requiresPermission ?? false
         if isEnabled, needsKeyboardPermission { keyboardUnavailable() }
     }

@@ -30,6 +30,7 @@ struct MenuView: View {
             model.refreshPorts()
             model.checkDaemonVersion()
             displays.reload()
+            brightness.refreshKeyboardPermission()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
             if isVisible { updateScreenHeight(preferWindow: true) }
