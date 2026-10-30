@@ -1,6 +1,10 @@
 import AppKit
 import CoreGraphics
 import IOKit
+import os
+
+/// 排查插拔问题用：`log stream --predicate 'subsystem == "com.local.batterycycle"'`
+private let displayLog = Logger(subsystem: "com.local.batterycycle", category: "display")
 
 struct ExternalDisplay: Identifiable, Equatable {
     let id: CGDirectDisplayID
@@ -86,6 +90,8 @@ final class DisplayController: ObservableObject {
     private var wakeObservers: [NSObjectProtocol] = []
     private var observer: NSObjectProtocol?
     private var timer: Timer?
+    /// 上次记到日志里的显示器状态，变了才记，避免定时刷新刷屏
+    private var lastSnapshot = ""
 
     init() {
         let data = UserDefaults.standard.data(forKey: "disabledDisplays")
@@ -94,6 +100,7 @@ final class DisplayController: ObservableObject {
             guard !record.unplugged || record.boot == Self.bootSession else { return nil }
             return CGDirectDisplayID(key).map { ($0, record) }
         })
+        displayLog.notice("启动 boot=\(Self.bootSession, privacy: .public) 已存记录=\(stored.count) 载入=\(self.disabled.count)")
         reload()
         observer = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -142,12 +149,13 @@ final class DisplayController: ObservableObject {
             let active = CGDisplayIsActive(id) != 0
             // 插回来恢复成功、注销重启后系统恢复显示，或者在别处被打开了，记录作废
             if active && disabled[id] != nil && !recentlyDisabled(id) {
-                forget(id)
+                forget(id, "已在显示")
             }
             list.append((id, knownNames[id] ?? disabled[id]?.name ?? "外接显示器", active && disabled[id] == nil))
         }
         let activeExternals = online.filter { CGDisplayIsActive($0) != 0 && disabled[$0] == nil }
         var restoreFailed: [String] = []
+        logSnapshot(online: online)
         if !disabled.isEmpty, hardwareSettled, let attached = Self.attachedModels() {
             // 先恢复之前拔掉、现在插回来的，再找新拔掉的；同一轮里刚标记拔掉的不会马上被当成插回来
             restoreFailed = restoreReplugged(attached: attached, activeExternals: activeExternals)
@@ -200,15 +208,16 @@ final class DisplayController: ObservableObject {
                 } else if markIfUnplugged(display.id) {
                     message = "「\(display.name)」已拔掉，插回来时会自动恢复"
                 } else {
-                    forget(display.id)
+                    forget(display.id, "手动恢复连续失败")
                     message = "仍无法恢复「\(display.name)」，已从列表移除，可注销重新登录恢复"
                 }
             } else if !markIfUnplugged(display.id) {
-                forget(display.id)
+                forget(display.id, "手动恢复成功")
             }
         } else if let error {
             message = "无法断开「\(display.name)」（\(error)）"
         } else {
+            displayLog.notice("断开 \(display.id) 型号=\(model.vendor)/\(model.product)")
             disabled[display.id] = DisabledDisplay(name: knownNames[display.id] ?? display.name, model: model)
             disabledAt[display.id] = Date()
             failedEnable.remove(display.id)
@@ -220,7 +229,8 @@ final class DisplayController: ObservableObject {
         Date().timeIntervalSince(disabledAt[id] ?? .distantPast) < 5
     }
 
-    private func forget(_ id: CGDirectDisplayID) {
+    private func forget(_ id: CGDirectDisplayID, _ reason: String) {
+        if disabled[id] != nil { displayLog.notice("删除记录 \(id) 原因=\(reason, privacy: .public)") }
         disabled[id] = nil
         disabledAt[id] = nil
         failedEnable.remove(id)
@@ -238,6 +248,7 @@ final class DisplayController: ObservableObject {
         let others = disabled.filter { $0.key != id && !$0.value.unplugged && $0.value.model == record.model }.count
         let available = attached[record.model, default: 0] - Self.countModels(activeExternals)[record.model, default: 0] - others
         guard available <= 0 else { return false }
+        displayLog.notice("标记拔掉 \(id)（恢复操作后硬件里看不到）")
         disabled[id]?.unplugged = true
         failedEnable.remove(id)
         return true
@@ -259,6 +270,7 @@ final class DisplayController: ObservableObject {
             if available >= ids.count {
                 shortSince[model] = nil
                 for id in ids where disabled[id]?.confirmedAttached == false {
+                    displayLog.notice("确认断开后硬件里仍能看到 \(id)")
                     disabled[id]?.confirmedAttached = true
                 }
                 continue
@@ -272,6 +284,7 @@ final class DisplayController: ObservableObject {
             // 还连着的会亮起来，下次刷新时记录作废。真拔掉的恢复不会生效（即使返回成功，系统仍记着它是断开的，
             // 插回来照样黑屏），所以记录留着、标记为拔掉，等插回来再恢复
             for id in ids {
+                displayLog.notice("检测到拔掉 \(id)")
                 _ = configure(id, enabled: true)
                 disabled[id]?.unplugged = true
                 failedEnable.remove(id)
@@ -299,6 +312,7 @@ final class DisplayController: ObservableObject {
             // 没成功的回到列表里（开关是关的），可以手动再试。多出来的、或者硬件信息抖动其实没插回来的，10 秒后会再被标记为拔掉
             var anySucceeded = false
             for id in ids.sorted() {
+                displayLog.notice("检测到插回 \(id)，尝试恢复")
                 if configure(id, enabled: true) == nil { anySucceeded = true }
                 disabled[id]?.unplugged = false
                 failedEnable.remove(id)
@@ -324,7 +338,7 @@ final class DisplayController: ObservableObject {
         var failed: [String] = []
         for (id, record) in disabled where !record.unplugged {
             if configure(id, enabled: true) == nil {
-                if !markIfUnplugged(id) { forget(id) }
+                if !markIfUnplugged(id) { forget(id, "关闭管理时恢复成功") }
             } else {
                 failed.append(record.name)
             }
@@ -343,10 +357,29 @@ final class DisplayController: ObservableObject {
         let r = setEnabled(config, id, enabled)
         guard r == 0 else {
             _ = CGCancelDisplayConfiguration(config)
+            displayLog.notice("配置 \(id) enabled=\(enabled) 调用失败=\(r)")
             return "错误 \(r)"
         }
         let done = CGCompleteDisplayConfiguration(config, .forSession)
+        displayLog.notice("配置 \(id) enabled=\(enabled) 结果=\(done.rawValue)")
         return done == .success ? nil : "错误 \(done.rawValue)"
+    }
+
+    private func logSnapshot(online: [CGDirectDisplayID]) {
+        let displays = online.map { id in
+            "\(id)[\(CGDisplayIsActive(id) != 0 ? "显示" : "未显示") \(CGDisplayVendorNumber(id))/\(CGDisplayModelNumber(id))]"
+        }
+        let hardware = Self.attachedModels().map { counts in
+            counts.map { "\($0.key.vendor)/\($0.key.product)×\($0.value)" }.sorted().joined(separator: " ")
+        } ?? "查不到"
+        let records = disabled.keys.sorted().map { id in
+            let r = disabled[id]!
+            return "\(id)[\(r.model.vendor)/\(r.model.product) 确认=\(r.confirmedAttached) 拔掉=\(r.unplugged)]"
+        }
+        let snapshot = "在线外接=\(displays.joined(separator: " ")) 硬件=\(hardware) 记录=\(records.joined(separator: " ")) 可判断=\(hardwareSettled)"
+        guard snapshot != lastSnapshot else { return }
+        lastSnapshot = snapshot
+        displayLog.notice("\(snapshot, privacy: .public)")
     }
 
     /// 本次开机的会话 UUID，读不到时为空。不用开机时间：系统校时会改动它
