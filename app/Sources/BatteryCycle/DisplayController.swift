@@ -89,6 +89,8 @@ final class DisplayController: ObservableObject {
     private var sufficientSince: [DisplayModel: Date] = [:]
     /// 插回来刚恢复的时间：系统要过一会儿才把它标成活跃，这段时间里不能当成又拔掉了去试探
     private var restoredAt: [CGDirectDisplayID: Date] = [:]
+    /// 插回后恢复开始报「不存在」的时间：硬件里先出现，系统要过一会儿才认到这台显示器，这段时间里重试
+    private var replugSince: [CGDirectDisplayID: Date] = [:]
     /// 插回来自动恢复失败、已经提示过的显示器；同型号几台时会反复标记、重试，只提示一次
     private var restoreFailedNotified: Set<CGDirectDisplayID> = []
     /// 各型号开始「硬件里数量不够」的时间；持续一段时间才算拔掉，避免唤醒等瞬间的抖动
@@ -177,6 +179,8 @@ final class DisplayController: ObservableObject {
         } else {
             shortSince = [:]
             sufficientSince = [:]
+            // 不判断的这段时间不能算进插回后的等待
+            replugSince = [:]
         }
         // 拔掉但没能确定的记录照样列出（开关关着）：万一其实还连着，不能没了开关
         for (id, record) in disabled where !record.hidden && !list.contains(where: { $0.id == id }) {
@@ -256,6 +260,7 @@ final class DisplayController: ObservableObject {
         restoreFailedNotified.remove(id)
         probedAttached.remove(id)
         restoredAt[id] = nil
+        replugSince[id] = nil
     }
 
     /// 恢复操作之后：硬件里已经看不到这台（拔线后还没来得及标记），恢复不会生效，
@@ -373,23 +378,47 @@ final class DisplayController: ObservableObject {
             spare[record.model, default: 0] -= 1
         }
         var failed: [String] = []
+        let now = Date()
         for (model, ids) in Dictionary(grouping: unplugged.keys, by: { unplugged[$0]!.model }) {
-            guard spare[model, default: 0] > 0 else { continue }
+            guard spare[model, default: 0] > 0 else {
+                for id in ids { replugSince[id] = nil }
+                continue
+            }
             shortSince[model] = nil
             // 同型号的几台分不清插回来的是哪台，全部尝试恢复（对不在的无害）。成功的亮起来后下次刷新时记录作废；
             // 没成功的回到列表里（开关是关的），可以手动再试。多出来的、或者硬件信息抖动其实没插回来的，十几秒后会再被标记为拔掉
             var anySucceeded = false
+            var waiting = false
+            // 报错的是连着却恢复不了的，马上提示；等满 10 秒仍报不存在的，同型号还有在等的就先不提示
+            var failedIDs: [CGDirectDisplayID] = []
+            var timedOut: [CGDirectDisplayID] = []
             for id in ids.sorted() {
-                displayLog.notice("检测到插回 \(id)，尝试恢复")
-                if configure(id, enabled: true) == nil { anySucceeded = true }
+                if replugSince[id] == nil { displayLog.notice("检测到插回 \(id)，尝试恢复") }
+                let error = configure(id, enabled: true)
+                if error == nil {
+                    anySucceeded = true
+                } else if error == Self.absentError {
+                    // 硬件里先出现，系统要过一会儿才认到这台显示器（有时它会自己亮起来）：
+                    // 先不报错，留着标记每秒重试，最多等 10 秒
+                    let since = replugSince[id] ?? now
+                    replugSince[id] = since
+                    if now.timeIntervalSince(since) < 10 {
+                        waiting = true
+                        continue
+                    }
+                }
+                if error == Self.absentError { timedOut.append(id) } else if error != nil { failedIDs.append(id) }
+                replugSince[id] = nil
                 disabled[id]?.unplugged = false
                 disabled[id]?.absent = false
-                restoredAt[id] = Date()
+                restoredAt[id] = now
                 failedEnable.remove(id)
             }
-            if !anySucceeded && !restoreFailedNotified.isSuperset(of: ids) {
-                restoreFailedNotified.formUnion(ids)
-                failed += ids.sorted().compactMap { disabled[$0]?.name }
+            guard !anySucceeded else { continue }
+            let report = failedIDs + (waiting ? [] : timedOut)
+            if !report.isEmpty && !restoreFailedNotified.isSuperset(of: report) {
+                restoreFailedNotified.formUnion(report)
+                failed += report.compactMap { disabled[$0]?.name }
             }
         }
         return failed
