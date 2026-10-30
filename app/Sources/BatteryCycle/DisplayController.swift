@@ -21,6 +21,26 @@ private struct DisabledDisplay: Codable {
     /// 断开后在硬件里确实还能看到这个型号；之后看不到了才算拔掉，
     /// 这样即使某些系统上断开后硬件信息也消失，也不会误删还连着的显示器。存下来，App 重启后照样能判断
     var confirmedAttached = false
+    /// 断开状态下被拔掉了：列表里不显示，插回来时自动恢复。系统会一直记着它是断开的，
+    /// 不恢复的话插回来也不亮、列表里也没有它，只能注销或重启
+    var unplugged = false
+    /// 记录时的开机会话：系统重启后断开状态就没了，上次开机留下的拔掉记录直接丢掉，不用一直查硬件
+    var boot: String = DisplayController.bootSession
+
+    init(name: String, model: DisplayModel) {
+        self.name = name
+        self.model = model
+    }
+
+    /// 旧版本存的记录没有后加的字段，按默认值读
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        model = try c.decode(DisplayModel.self, forKey: .model)
+        confirmedAttached = try c.decodeIfPresent(Bool.self, forKey: .confirmedAttached) ?? false
+        unplugged = try c.decodeIfPresent(Bool.self, forKey: .unplugged) ?? false
+        boot = try c.decodeIfPresent(String.self, forKey: .boot) ?? ""
+    }
 }
 
 /// 断开 / 恢复外接显示器：和拔掉线的效果一样，系统不再输出画面，窗口挪到其他屏幕
@@ -51,15 +71,15 @@ final class DisplayController: ObservableObject {
     private var knownNames: [CGDirectDisplayID: String] = [:]
     /// 刚断开的时间：系统要过一会儿才把它标成不活跃，这段时间里不能当成「已自动恢复」
     private var disabledAt: [CGDirectDisplayID: Date] = [:]
-    /// 恢复失败过一次的显示器；再失败就从列表移除
+    /// 恢复失败过一次的显示器；再失败就标记为拔掉（硬件里看不到时）或从列表移除
     private var failedEnable: Set<CGDirectDisplayID> = []
-    /// 拔线检测里自动恢复失败过一次的显示器；和手动重试分开计，硬件数量恢复正常就清零
-    private var autoFailed: Set<CGDirectDisplayID> = []
+    /// 插回来自动恢复失败、已经提示过的显示器；同型号几台时会反复标记、重试，只提示一次
+    private var restoreFailedNotified: Set<CGDirectDisplayID> = []
     /// 各型号开始「硬件里数量不够」的时间；持续一段时间才算拔掉，避免唤醒等瞬间的抖动
     private var shortSince: [DisplayModel: Date] = [:]
-    /// 唤醒（包括屏幕熄灭后点亮）后硬件信息要一会儿才稳定，这段时间不判断拔线
+    /// 唤醒（包括屏幕熄灭后点亮）后硬件信息要一会儿才稳定，这段时间不判断插拔
     private var wokeAt = Date.distantPast
-    /// 系统睡眠、屏幕熄灭期间显示器可能进入待机，硬件信息不可信，不判断拔线。
+    /// 系统睡眠、屏幕熄灭期间显示器可能进入待机，硬件信息不可信，不判断插拔。
     /// 分开记：系统可能在屏幕仍熄灭时短暂唤醒（如定时维护）
     private var systemAsleep = false
     private var screensAsleep = false
@@ -71,7 +91,8 @@ final class DisplayController: ObservableObject {
         let data = UserDefaults.standard.data(forKey: "disabledDisplays")
         let stored = data.flatMap { try? JSONDecoder().decode([String: DisabledDisplay].self, from: $0) } ?? [:]
         disabled = Dictionary(uniqueKeysWithValues: stored.compactMap { key, record in
-            CGDirectDisplayID(key).map { ($0, record) }
+            guard !record.unplugged || record.boot == Self.bootSession else { return nil }
+            return CGDirectDisplayID(key).map { ($0, record) }
         })
         reload()
         observer = NotificationCenter.default.addObserver(
@@ -93,12 +114,11 @@ final class DisplayController: ObservableObject {
                     self[keyPath: flag] = asleep
                     // 熄灭前后记下的「数量不够」不能算进点亮后的持续时间
                     self.shortSince = [:]
-                    self.autoFailed = []
                     if !asleep { self.wokeAt = Date() }
                 }
             })
         }
-        // 拔掉已断开的显示器时系统不发屏幕变化通知，只能定时去硬件里查
+        // 拔掉、插回已断开的显示器时系统不发屏幕变化通知，只能定时去硬件里查
         let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, !self.disabled.isEmpty else { return }
@@ -120,14 +140,22 @@ final class DisplayController: ObservableObject {
         var list: [(id: CGDirectDisplayID, name: String, enabled: Bool)] = []
         for id in online {
             let active = CGDisplayIsActive(id) != 0
-            // 重新插线、重启后系统会自己恢复显示，记录作废
+            // 插回来恢复成功、注销重启后系统恢复显示，或者在别处被打开了，记录作废
             if active && disabled[id] != nil && !recentlyDisabled(id) {
                 forget(id)
             }
             list.append((id, knownNames[id] ?? disabled[id]?.name ?? "外接显示器", active && disabled[id] == nil))
         }
-        forgetUnplugged(activeExternals: online.filter { CGDisplayIsActive($0) != 0 && disabled[$0] == nil })
-        for (id, record) in disabled where !list.contains(where: { $0.id == id }) {
+        let activeExternals = online.filter { CGDisplayIsActive($0) != 0 && disabled[$0] == nil }
+        var restoreFailed: [String] = []
+        if !disabled.isEmpty, hardwareSettled, let attached = Self.attachedModels() {
+            // 先恢复之前拔掉、现在插回来的，再找新拔掉的；同一轮里刚标记拔掉的不会马上被当成插回来
+            restoreFailed = restoreReplugged(attached: attached, activeExternals: activeExternals)
+            markUnplugged(attached: attached, activeExternals: activeExternals)
+        } else {
+            shortSince = [:]
+        }
+        for (id, record) in disabled where !record.unplugged && !list.contains(where: { $0.id == id }) {
             list.append((id, record.name, false))
         }
         list.sort { $0.id < $1.id }
@@ -143,6 +171,12 @@ final class DisplayController: ObservableObject {
             return ExternalDisplay(id: item.id, name: "\(item.name) (\(seen[item.name]!))", enabled: item.enabled)
         }
         if displays != result { displays = result }
+
+        if !restoreFailed.isEmpty {
+            // 插回来没能恢复：显示器连着却黑着，展开列表露出它的开关（打开时会再刷新一次，那时已不算拔掉，不会重复提示）
+            if !manageDisplays { manageDisplays = true }
+            message = "插回的「\(restoreFailed.joined(separator: "、"))」没能自动恢复，请打开开关再试"
+        }
     }
 
     func setEnabled(_ display: ExternalDisplay, _ on: Bool) {
@@ -160,14 +194,16 @@ final class DisplayController: ObservableObject {
         let error = configure(display.id, enabled: on)
         if on {
             if let error {
-                // 偶尔失败可以再试；连续两次失败多半是显示器已经拔掉，记录没用了
+                // 偶尔失败可以再试；连续两次失败多半是显示器已经拔掉：硬件里看不到就标记拔掉等插回来，否则记录没用了
                 if failedEnable.insert(display.id).inserted {
                     message = "无法恢复「\(display.name)」（\(error)），请再试一次"
+                } else if markIfUnplugged(display.id) {
+                    message = "「\(display.name)」已拔掉，插回来时会自动恢复"
                 } else {
                     forget(display.id)
-                    message = "仍无法恢复「\(display.name)」，已从列表移除，请重新插拔线"
+                    message = "仍无法恢复「\(display.name)」，已从列表移除，可注销重新登录恢复"
                 }
-            } else {
+            } else if !markIfUnplugged(display.id) {
                 forget(display.id)
             }
         } else if let error {
@@ -188,27 +224,40 @@ final class DisplayController: ObservableObject {
         disabled[id] = nil
         disabledAt[id] = nil
         failedEnable.remove(id)
-        autoFailed.remove(id)
+        restoreFailedNotified.remove(id)
     }
 
-    /// 断开的显示器被拔掉后从列表移除。硬件里同型号的显示器数量 = 正在显示的 + 断开的，
+    /// 恢复操作之后：硬件里已经看不到这台（拔线后还没来得及标记），恢复不会生效，
+    /// 标记为拔掉、等插回来再恢复，不能删记录。只在确认过断开后硬件信息还在时判断
+    private func markIfUnplugged(_ id: CGDirectDisplayID) -> Bool {
+        guard let record = disabled[id], !record.unplugged, record.confirmedAttached,
+              let attached = Self.attachedModels() else { return false }
+        let activeExternals = Self.onlineDisplays().filter {
+            CGDisplayIsBuiltin($0) == 0 && CGDisplayIsActive($0) != 0 && disabled[$0] == nil
+        }
+        let others = disabled.filter { $0.key != id && !$0.value.unplugged && $0.value.model == record.model }.count
+        let available = attached[record.model, default: 0] - Self.countModels(activeExternals)[record.model, default: 0] - others
+        guard available <= 0 else { return false }
+        disabled[id]?.unplugged = true
+        failedEnable.remove(id)
+        return true
+    }
+
+    /// 系统睡眠、屏幕熄灭期间显示器可能进入待机，唤醒后硬件信息也要一会儿才稳定，这些时候不判断插拔
+    private var hardwareSettled: Bool {
+        !systemAsleep && !screensAsleep && Date().timeIntervalSince(wokeAt) > 20
+    }
+
+    /// 断开的显示器被拔掉后从列表隐藏。硬件里同型号的显示器数量 = 正在显示的 + 断开的，
     /// 少了并且持续 10 秒以上，就说明有断开的被拔掉了
-    private func forgetUnplugged(activeExternals: [CGDirectDisplayID]) {
-        guard !systemAsleep, !screensAsleep, Date().timeIntervalSince(wokeAt) > 20 else {
-            shortSince = [:]
-            return
-        }
-        guard !disabled.isEmpty, let attached = Self.attachedModels() else { return }
-        var active: [DisplayModel: Int] = [:]
-        for id in activeExternals {
-            active[DisplayModel(vendor: CGDisplayVendorNumber(id), product: CGDisplayModelNumber(id)), default: 0] += 1
-        }
-        let groups = Dictionary(grouping: disabled.keys.filter { !recentlyDisabled($0) }) { disabled[$0]!.model }
+    private func markUnplugged(attached: [DisplayModel: Int], activeExternals: [CGDirectDisplayID]) {
+        let active = Self.countModels(activeExternals)
+        let candidates = disabled.keys.filter { disabled[$0]?.unplugged == false && !recentlyDisabled($0) }
+        let groups = Dictionary(grouping: candidates) { disabled[$0]!.model }
         for (model, ids) in groups {
             let available = attached[model, default: 0] - active[model, default: 0]
             if available >= ids.count {
                 shortSince[model] = nil
-                autoFailed.subtract(ids)
                 for id in ids where disabled[id]?.confirmedAttached == false {
                     disabled[id]?.confirmedAttached = true
                 }
@@ -219,33 +268,69 @@ final class DisplayController: ObservableObject {
             shortSince[model] = since
             guard Date().timeIntervalSince(since) >= 10 else { continue }
             shortSince[model] = nil
-            // 先尝试恢复再移除：真拔掉了恢复无害；万一只是显示器待机让硬件信息暂时消失，
-            // 它会亮起来重新出现在列表里，而不是还连着、黑着却没了开关。
-            // 同型号的几台里分不清拔掉的是哪台时也一样，恢复成功的会重新出现在列表里
+            // 先尝试恢复：万一只是显示器待机让硬件信息暂时消失，或者同型号的几台里分不清拔掉的是哪台，
+            // 还连着的会亮起来，下次刷新时记录作废。真拔掉的恢复不会生效（即使返回成功，系统仍记着它是断开的，
+            // 插回来照样黑屏），所以记录留着、标记为拔掉，等插回来再恢复
             for id in ids {
-                if configure(id, enabled: true) == nil {
-                    forget(id)
-                } else if available <= 0 && !autoFailed.insert(id).inserted {
-                    // 这个型号断开的全都不在了，连续两轮恢复失败，确实拔掉了
-                    forget(id)
-                }
-                // 其余失败的留着，下一轮数量对得上时再处理
+                _ = configure(id, enabled: true)
+                disabled[id]?.unplugged = true
+                failedEnable.remove(id)
             }
         }
     }
 
-    /// 返回是否全部恢复成功；失败的留在列表里
+    /// 拔掉的显示器插回来后恢复显示：硬件里这个型号的数量比「正在显示的 + 还连着的断开显示器」多，就是插回来了。
+    /// 返回没能恢复的显示器名称
+    private func restoreReplugged(attached: [DisplayModel: Int], activeExternals: [CGDirectDisplayID]) -> [String] {
+        let unplugged = disabled.filter { $0.value.unplugged }
+        guard !unplugged.isEmpty else { return [] }
+        var spare = attached
+        for (model, count) in Self.countModels(activeExternals) {
+            spare[model, default: 0] -= count
+        }
+        for record in disabled.values where !record.unplugged {
+            spare[record.model, default: 0] -= 1
+        }
+        var failed: [String] = []
+        for (model, ids) in Dictionary(grouping: unplugged.keys, by: { unplugged[$0]!.model }) {
+            guard spare[model, default: 0] > 0 else { continue }
+            shortSince[model] = nil
+            // 同型号的几台分不清插回来的是哪台，全部尝试恢复（对不在的无害）。成功的亮起来后下次刷新时记录作废；
+            // 没成功的回到列表里（开关是关的），可以手动再试。多出来的、或者硬件信息抖动其实没插回来的，10 秒后会再被标记为拔掉
+            var anySucceeded = false
+            for id in ids.sorted() {
+                if configure(id, enabled: true) == nil { anySucceeded = true }
+                disabled[id]?.unplugged = false
+                failedEnable.remove(id)
+            }
+            if !anySucceeded && !restoreFailedNotified.isSuperset(of: ids) {
+                restoreFailedNotified.formUnion(ids)
+                failed += ids.sorted().compactMap { disabled[$0]?.name }
+            }
+        }
+        return failed
+    }
+
+    private static func countModels(_ ids: [CGDirectDisplayID]) -> [DisplayModel: Int] {
+        var counts: [DisplayModel: Int] = [:]
+        for id in ids {
+            counts[DisplayModel(vendor: CGDisplayVendorNumber(id), product: CGDisplayModelNumber(id)), default: 0] += 1
+        }
+        return counts
+    }
+
+    /// 返回是否全部恢复成功；失败的留在列表里。拔掉的这时恢复不会生效，留着记录，插回来时自动恢复
     private func enableAll() -> Bool {
         var failed: [String] = []
-        for (id, record) in disabled {
+        for (id, record) in disabled where !record.unplugged {
             if configure(id, enabled: true) == nil {
-                forget(id)
+                if !markIfUnplugged(id) { forget(id) }
             } else {
                 failed.append(record.name)
             }
         }
         if !failed.isEmpty {
-            message = "无法恢复「\(failed.joined(separator: "、"))」，请再试一次或重新插拔线"
+            message = "无法恢复「\(failed.joined(separator: "、"))」，请再试一次或注销重新登录"
         }
         return failed.isEmpty
     }
@@ -263,6 +348,15 @@ final class DisplayController: ObservableObject {
         let done = CGCompleteDisplayConfiguration(config, .forSession)
         return done == .success ? nil : "错误 \(done.rawValue)"
     }
+
+    /// 本次开机的会话 UUID，读不到时为空。不用开机时间：系统校时会改动它
+    nonisolated static let bootSession: String = {
+        var size = 0
+        guard sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 0 else { return "" }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("kern.bootsessionuuid", &buffer, &size, nil, 0) == 0 else { return "" }
+        return String(cString: buffer)
+    }()
 
     private static func onlineDisplays() -> [CGDirectDisplayID] {
         var count: UInt32 = 0
