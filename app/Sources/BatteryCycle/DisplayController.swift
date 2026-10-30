@@ -82,8 +82,13 @@ final class DisplayController: ObservableObject {
     private var disabledAt: [CGDirectDisplayID: Date] = [:]
     /// 恢复失败过一次、又没能判断为拔掉的显示器；再失败就从列表移除
     private var failedEnable: Set<CGDirectDisplayID> = []
-    /// 没确认过硬件信息、试探恢复时其实还连着的显示器（断开后硬件信息会消失的系统）；不再试探，免得反复闪
+    /// 试探过、没能判断为拔掉的显示器（其实还连着又马上断开了，或者说不清的失败）；
+    /// 硬件里稳定看到它之前不再试探，免得反复闪
     private var probedAttached: Set<CGDirectDisplayID> = []
+    /// 各型号硬件数量开始恢复正常的时间；稳定一段时间才重新允许试探（待机的显示器可能时有时无）
+    private var sufficientSince: [DisplayModel: Date] = [:]
+    /// 插回来刚恢复的时间：系统要过一会儿才把它标成活跃，这段时间里不能当成又拔掉了去试探
+    private var restoredAt: [CGDirectDisplayID: Date] = [:]
     /// 插回来自动恢复失败、已经提示过的显示器；同型号几台时会反复标记、重试，只提示一次
     private var restoreFailedNotified: Set<CGDirectDisplayID> = []
     /// 各型号开始「硬件里数量不够」的时间；持续一段时间才算拔掉，避免唤醒等瞬间的抖动
@@ -128,12 +133,13 @@ final class DisplayController: ObservableObject {
                     self[keyPath: flag] = asleep
                     // 熄灭前后记下的「数量不够」不能算进点亮后的持续时间
                     self.shortSince = [:]
+                    self.sufficientSince = [:]
                     if !asleep { self.wokeAt = Date() }
                 }
             })
         }
-        // 拔掉、插回已断开的显示器时系统不发屏幕变化通知，只能定时去硬件里查
-        let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
+        // 拔掉、插回已断开的显示器时系统不发屏幕变化通知，只能定时去硬件里查；查得勤一点，列表跟得上插拔
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, !self.disabled.isEmpty else { return }
                 self.reload()
@@ -162,13 +168,15 @@ final class DisplayController: ObservableObject {
         }
         let activeExternals = online.filter { CGDisplayIsActive($0) != 0 && disabled[$0] == nil }
         var restoreFailed: [String] = []
-        logSnapshot(online: online)
-        if !disabled.isEmpty, hardwareSettled, let attached = Self.attachedModels() {
+        let hardware = Self.attachedModels()
+        logSnapshot(online: online, attached: hardware)
+        if !disabled.isEmpty, hardwareSettled, let attached = hardware {
             // 先恢复之前拔掉、现在插回来的，再找新拔掉的；同一轮里刚标记拔掉的不会马上被当成插回来
             restoreFailed = restoreReplugged(attached: attached, activeExternals: activeExternals)
             markUnplugged(attached: attached, activeExternals: activeExternals)
         } else {
             shortSince = [:]
+            sufficientSince = [:]
         }
         // 拔掉但没能确定的记录照样列出（开关关着）：万一其实还连着，不能没了开关
         for (id, record) in disabled where !record.hidden && !list.contains(where: { $0.id == id }) {
@@ -247,6 +255,7 @@ final class DisplayController: ObservableObject {
         failedEnable.remove(id)
         restoreFailedNotified.remove(id)
         probedAttached.remove(id)
+        restoredAt[id] = nil
     }
 
     /// 恢复操作之后：硬件里已经看不到这台（拔线后还没来得及标记），恢复不会生效，
@@ -286,38 +295,46 @@ final class DisplayController: ObservableObject {
     }
 
     /// 断开的显示器被拔掉后标记出来，能确定的从列表隐藏。硬件里同型号的显示器数量 = 正在显示的 + 断开的，
-    /// 少了并且持续 10 秒以上，就说明有断开的被拔掉了
+    /// 少了并且持续 1 秒以上，就可能有断开的被拔掉了，再逐台试探确认
     private func markUnplugged(attached: [DisplayModel: Int], activeExternals: [CGDirectDisplayID]) {
         let active = Self.countModels(activeExternals)
-        let candidates = disabled.keys.filter { disabled[$0]?.unplugged == false && !recentlyDisabled($0) }
+        // 刚断开的 2 秒内硬件信息可能还在变、刚插回恢复的 15 秒内系统可能还没标成活跃，先不判断
+        let now = Date()
+        let candidates = disabled.keys.filter {
+            disabled[$0]?.unplugged == false
+                && now.timeIntervalSince(disabledAt[$0] ?? .distantPast) >= 2
+                && now.timeIntervalSince(restoredAt[$0] ?? .distantPast) >= 15
+        }
         let groups = Dictionary(grouping: candidates) { disabled[$0]!.model }
         for (model, ids) in groups {
             let available = attached[model, default: 0] - active[model, default: 0]
             if available >= ids.count {
                 shortSince[model] = nil
+                let since = sufficientSince[model] ?? now
+                sufficientSince[model] = since
+                if now.timeIntervalSince(since) >= 10 { probedAttached.subtract(ids) }
                 for id in ids where disabled[id]?.confirmedAttached == false {
                     displayLog.notice("确认断开后硬件里仍能看到 \(id)")
                     disabled[id]?.confirmedAttached = true
                 }
                 continue
             }
-            // 没确认过硬件信息的也要处理（断开后马上拔线时来不及确认），靠试探恢复的结果判断
-            guard ids.contains(where: { disabled[$0]?.confirmedAttached == true || !probedAttached.contains($0) })
-            else { continue }
-            let since = shortSince[model] ?? Date()
+            sufficientSince[model] = nil
+            guard ids.contains(where: { !probedAttached.contains($0) }) else { continue }
+            let since = shortSince[model] ?? now
             shortSince[model] = since
-            guard Date().timeIntervalSince(since) >= 10 else { continue }
+            // 连续两次刷新（每秒一次）都看不到才试探，避开瞬间的抖动；试探本身不会改变用户的选择，不用等太久
+            guard now.timeIntervalSince(since) >= 0.8 else { continue }
             shortSince[model] = nil
-            // 先尝试恢复。确认过的：万一只是显示器待机让硬件信息暂时消失，或者同型号的几台里分不清拔掉的是哪台，
-            // 还连着的会亮起来，下次刷新时记录作废；真拔掉的恢复不会生效，记录留着、标记为拔掉，等插回来再恢复。
-            // 没确认过的（断开后马上拔线，来不及确认）：系统报不存在就确定拔掉了；恢复成功说明其实还连着
-            // （断开后硬件信息会消失的系统），马上再断开，保持用户的选择，之后不再试探它
-            for id in ids {
-                guard let record = disabled[id] else { continue }
-                if !record.confirmedAttached && probedAttached.contains(id) { continue }
+            // 试探着恢复一下：系统报不存在就确定拔掉了；恢复成功说明其实还连着（显示器待机让硬件信息暂时消失、
+            // 同型号几台分不清拔掉的是哪台，或者断开后硬件信息会消失的系统），马上再断开，保持用户的选择。
+            // 只有系统报不存在才算拔掉；说不清的失败不判断，留在列表里
+            for id in ids where !probedAttached.contains(id) {
+                // 正在显示的不是拔掉了，记录交给刷新时作废
+                guard let record = disabled[id], CGDisplayIsActive(id) == 0 else { continue }
                 displayLog.notice("检测到拔掉 \(id) 确认=\(record.confirmedAttached)")
                 let error = configure(id, enabled: true)
-                if !record.confirmedAttached && error == nil {
+                if error == nil {
                     disabledAt[id] = Date()
                     let again = configure(id, enabled: false)
                     if again == Self.absentError {
@@ -331,13 +348,13 @@ final class DisplayController: ObservableObject {
                     }
                     continue
                 }
-                if !record.confirmedAttached && error != Self.absentError {
-                    // 说不清的失败：不判断，留在列表里，不再试探
+                guard error == Self.absentError else {
+                    displayLog.notice("试探 \(id) 失败，不判断：\(error ?? "", privacy: .public)")
                     probedAttached.insert(id)
                     continue
                 }
                 disabled[id]?.unplugged = true
-                if error == Self.absentError { disabled[id]?.absent = true }
+                disabled[id]?.absent = true
                 failedEnable.remove(id)
             }
         }
@@ -360,13 +377,14 @@ final class DisplayController: ObservableObject {
             guard spare[model, default: 0] > 0 else { continue }
             shortSince[model] = nil
             // 同型号的几台分不清插回来的是哪台，全部尝试恢复（对不在的无害）。成功的亮起来后下次刷新时记录作废；
-            // 没成功的回到列表里（开关是关的），可以手动再试。多出来的、或者硬件信息抖动其实没插回来的，10 秒后会再被标记为拔掉
+            // 没成功的回到列表里（开关是关的），可以手动再试。多出来的、或者硬件信息抖动其实没插回来的，十几秒后会再被标记为拔掉
             var anySucceeded = false
             for id in ids.sorted() {
                 displayLog.notice("检测到插回 \(id)，尝试恢复")
                 if configure(id, enabled: true) == nil { anySucceeded = true }
                 disabled[id]?.unplugged = false
                 disabled[id]?.absent = false
+                restoredAt[id] = Date()
                 failedEnable.remove(id)
             }
             if !anySucceeded && !restoreFailedNotified.isSuperset(of: ids) {
@@ -429,11 +447,11 @@ final class DisplayController: ObservableObject {
         return done == .success ? nil : "错误 \(done.rawValue)"
     }
 
-    private func logSnapshot(online: [CGDirectDisplayID]) {
+    private func logSnapshot(online: [CGDirectDisplayID], attached: [DisplayModel: Int]?) {
         let displays = online.map { id in
             "\(id)[\(CGDisplayIsActive(id) != 0 ? "显示" : "未显示") \(CGDisplayVendorNumber(id))/\(CGDisplayModelNumber(id))]"
         }
-        let hardware = Self.attachedModels().map { counts in
+        let hardware = attached.map { counts in
             counts.map { "\($0.key.vendor)/\($0.key.product)×\($0.value)" }.sorted().joined(separator: " ")
         } ?? "查不到"
         let records = disabled.keys.sorted().map { id in
