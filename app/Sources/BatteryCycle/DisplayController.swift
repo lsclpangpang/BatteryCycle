@@ -13,13 +13,10 @@ struct ExternalDisplay: Identifiable, Equatable {
 }
 
 /// 显示器型号（EDID 里的厂商、产品编号），用来在硬件层面认出被断开的显示器
-private struct DisplayModel: Codable, Hashable {
-    let vendor: UInt32
-    let product: UInt32
-}
+typealias DisplayModel = DisplayOutputModel
 
 /// 本 App 断开的显示器。断开后系统里就查不到它的名字、型号了，只能靠这里记住
-private struct DisabledDisplay: Codable {
+struct DisabledDisplay: Codable {
     let name: String
     let model: DisplayModel
     /// 断开后在硬件里确实还能看到这个型号；之后看不到了才算拔掉（见 hidden），
@@ -34,10 +31,12 @@ private struct DisabledDisplay: Codable {
     var hidden: Bool { unplugged && (confirmedAttached || absent) }
     /// 记录时的开机会话：系统重启后断开状态就没了，上次开机留下的拔掉记录直接丢掉，不用一直查硬件
     var boot: String = DisplayController.bootSession
+    var outputIdentity: DisplayRestrictionRecord? = nil
 
-    init(name: String, model: DisplayModel) {
+    init(name: String, model: DisplayModel, outputIdentity: DisplayRestrictionRecord? = nil) {
         self.name = name
         self.model = model
+        self.outputIdentity = outputIdentity
     }
 
     /// 旧版本存的记录没有后加的字段，按默认值读
@@ -49,6 +48,7 @@ private struct DisabledDisplay: Codable {
         unplugged = try c.decodeIfPresent(Bool.self, forKey: .unplugged) ?? false
         absent = try c.decodeIfPresent(Bool.self, forKey: .absent) ?? false
         boot = try c.decodeIfPresent(String.self, forKey: .boot) ?? ""
+        outputIdentity = try c.decodeIfPresent(DisplayRestrictionRecord.self, forKey: .outputIdentity)
     }
 }
 
@@ -106,8 +106,16 @@ final class DisplayController: ObservableObject {
     private var timer: Timer?
     /// 上次记到日志里的显示器状态，变了才记，避免定时刷新刷屏
     private var lastSnapshot = ""
+    private let mayEnable: (CGDirectDisplayID, DisplayRestrictionRecord?) -> Bool
+    private let captureOutputIdentity: (CGDirectDisplayID) -> DisplayRestrictionRecord?
+    private let externalDisabledModels: () -> [DisplayOutputModel: Int]
 
-    init() {
+    init(mayEnable: @escaping (CGDirectDisplayID, DisplayRestrictionRecord?) -> Bool = { _, _ in true },
+         captureOutputIdentity: @escaping (CGDirectDisplayID) -> DisplayRestrictionRecord? = { _ in nil },
+         externalDisabledModels: @escaping () -> [DisplayOutputModel: Int] = { [:] }) {
+        self.mayEnable = mayEnable
+        self.captureOutputIdentity = captureOutputIdentity
+        self.externalDisabledModels = externalDisabledModels
         let data = UserDefaults.standard.data(forKey: "disabledDisplays")
         let stored = data.flatMap { try? JSONDecoder().decode([String: DisabledDisplay].self, from: $0) } ?? [:]
         disabled = Dictionary(uniqueKeysWithValues: stored.compactMap { key, record in
@@ -122,17 +130,17 @@ final class DisplayController: ObservableObject {
             Task { @MainActor in self?.reload() }
         }
         let center = NSWorkspace.shared.notificationCenter
-        let events: [(NSNotification.Name, ReferenceWritableKeyPath<DisplayController, Bool>, Bool)] = [
-            (NSWorkspace.willSleepNotification, \.systemAsleep, true),
-            (NSWorkspace.didWakeNotification, \.systemAsleep, false),
-            (NSWorkspace.screensDidSleepNotification, \.screensAsleep, true),
-            (NSWorkspace.screensDidWakeNotification, \.screensAsleep, false),
+        let events: [(NSNotification.Name, Bool, Bool)] = [
+            (NSWorkspace.willSleepNotification, true, true),
+            (NSWorkspace.didWakeNotification, true, false),
+            (NSWorkspace.screensDidSleepNotification, false, true),
+            (NSWorkspace.screensDidWakeNotification, false, false),
         ]
-        for (name, flag, asleep) in events {
+        for (name, system, asleep) in events {
             wakeObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
                     guard let self else { return }
-                    self[keyPath: flag] = asleep
+                    if system { self.systemAsleep = asleep } else { self.screensAsleep = asleep }
                     // 熄灭前后记下的「数量不够」不能算进点亮后的持续时间
                     self.shortSince = [:]
                     self.sufficientSince = [:]
@@ -172,7 +180,8 @@ final class DisplayController: ObservableObject {
         var restoreFailed: [String] = []
         let hardware = Self.attachedModels()
         logSnapshot(online: online, attached: hardware)
-        if !disabled.isEmpty, hardwareSettled, let attached = hardware {
+        if !disabled.isEmpty, hardwareSettled, let rawAttached = hardware {
+            let attached = DisplayOutputModelCounts.excludingRestricted(externalDisabledModels(), from: rawAttached)
             // 先恢复之前拔掉、现在插回来的，再找新拔掉的；同一轮里刚标记拔掉的不会马上被当成插回来
             restoreFailed = restoreReplugged(attached: attached, activeExternals: activeExternals)
             markUnplugged(attached: attached, activeExternals: activeExternals)
@@ -209,6 +218,10 @@ final class DisplayController: ObservableObject {
 
     func setEnabled(_ display: ExternalDisplay, _ on: Bool) {
         message = nil
+        if on && !mayEnable(display.id, disabled[display.id]?.outputIdentity) {
+            message = "请先在高级功能中调整设置"
+            return
+        }
         if !on {
             var count: UInt32 = 0
             _ = CGGetActiveDisplayList(0, nil, &count)
@@ -219,6 +232,7 @@ final class DisplayController: ObservableObject {
         }
         // 断开前先记下型号，断开后就读不到了
         let model = DisplayModel(vendor: CGDisplayVendorNumber(display.id), product: CGDisplayModelNumber(display.id))
+        let identity = on ? nil : captureOutputIdentity(display.id)
         let error = configure(display.id, enabled: on)
         if on {
             if let error {
@@ -241,7 +255,8 @@ final class DisplayController: ObservableObject {
             message = "无法断开「\(display.name)」（\(error)）"
         } else {
             displayLog.notice("断开 \(display.id) 型号=\(model.vendor)/\(model.product)")
-            disabled[display.id] = DisabledDisplay(name: knownNames[display.id] ?? display.name, model: model)
+            disabled[display.id] = DisabledDisplay(name: knownNames[display.id] ?? display.name,
+                                                   model: model, outputIdentity: identity)
             disabledAt[display.id] = Date()
             failedEnable.remove(display.id)
         }
@@ -281,7 +296,8 @@ final class DisplayController: ObservableObject {
             return enableError != nil
         }
         guard record.confirmedAttached || (enableError != nil && hardwareSettled),
-              let attached = Self.attachedModels() else { return false }
+              let rawAttached = Self.attachedModels() else { return false }
+        let attached = DisplayOutputModelCounts.excludingRestricted(externalDisabledModels(), from: rawAttached)
         let activeExternals = Self.onlineDisplays().filter {
             CGDisplayIsBuiltin($0) == 0 && CGDisplayIsActive($0) != 0 && disabled[$0] == nil
         }
@@ -335,6 +351,7 @@ final class DisplayController: ObservableObject {
             // 同型号几台分不清拔掉的是哪台，或者断开后硬件信息会消失的系统），马上再断开，保持用户的选择。
             // 只有系统报不存在才算拔掉；说不清的失败不判断，留在列表里
             for id in ids where !probedAttached.contains(id) {
+                guard mayEnable(id, disabled[id]?.outputIdentity) else { continue }
                 // 正在显示的不是拔掉了，记录交给刷新时作废
                 guard let record = disabled[id], CGDisplayIsActive(id) == 0 else { continue }
                 displayLog.notice("检测到拔掉 \(id) 确认=\(record.confirmedAttached)")
@@ -393,6 +410,10 @@ final class DisplayController: ObservableObject {
             var failedIDs: [CGDirectDisplayID] = []
             var timedOut: [CGDirectDisplayID] = []
             for id in ids.sorted() {
+                guard mayEnable(id, disabled[id]?.outputIdentity) else {
+                    replugSince[id] = nil
+                    continue
+                }
                 if replugSince[id] == nil { displayLog.notice("检测到插回 \(id)，尝试恢复") }
                 let error = configure(id, enabled: true)
                 if error == nil {
@@ -437,6 +458,10 @@ final class DisplayController: ObservableObject {
         var failed: [String] = []
         var maybeUnplugged: [String] = []
         for (id, record) in disabled where !record.hidden {
+            guard mayEnable(id, record.outputIdentity) else {
+                failed.append(record.name)
+                continue
+            }
             let error = configure(id, enabled: true)
             if error == nil {
                 // 标记拔掉的即使返回成功也可能没生效，留着；真亮了下次刷新时记录作废
@@ -462,6 +487,7 @@ final class DisplayController: ObservableObject {
 
     /// 只在本次登录期间生效：注销、重启后显示器都会恢复，不会一直黑屏
     private func configure(_ id: CGDirectDisplayID, enabled: Bool) -> String? {
+        if enabled && !mayEnable(id, disabled[id]?.outputIdentity) { return "请先在高级功能中调整设置" }
         guard let setEnabled = Self.configureDisplayEnabled else { return "系统不支持" }
         var config: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&config) == .success, let config else { return "无法开始配置" }
