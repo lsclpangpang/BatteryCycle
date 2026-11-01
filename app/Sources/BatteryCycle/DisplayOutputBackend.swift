@@ -31,9 +31,12 @@ struct DisplayOutputSnapshot: Equatable, Sendable {
     let isEnabled: Bool
     let port: DisplayOutputPort?
     let model: DisplayOutputModel?
+    let recoveryScope: String?
+    let isConfirmedEnabled: Bool?
 
     init(id: UInt32, uuid: String, name: String, isBuiltin: Bool,
-         isEnabled: Bool, port: DisplayOutputPort?, model: DisplayOutputModel? = nil) {
+         isEnabled: Bool, port: DisplayOutputPort?, model: DisplayOutputModel? = nil,
+         recoveryScope: String? = nil, isConfirmedEnabled: Bool? = nil) {
         self.id = id
         self.uuid = uuid
         self.name = name
@@ -41,7 +44,13 @@ struct DisplayOutputSnapshot: Equatable, Sendable {
         self.isEnabled = isEnabled
         self.port = port
         self.model = model
+        self.recoveryScope = recoveryScope
+        self.isConfirmedEnabled = isConfirmedEnabled
     }
+}
+
+enum DisplayRecoveryPresence: Equatable, Sendable {
+    case connected, disconnected, unknown
 }
 
 protocol DisplayOutputBackend {
@@ -49,8 +58,12 @@ protocol DisplayOutputBackend {
     func setEnabled(_ enabled: Bool, for display: DisplayOutputSnapshot) throws
     /// Seed recovery identities without making any hardware changes.
     func remember(_ displays: [DisplayOutputSnapshot])
+    func recoveryPresence(for display: DisplayOutputSnapshot) throws -> DisplayRecoveryPresence
+    func forgetRecovery(uuid: String)
 }
 
 extension DisplayOutputBackend {
     func remember(_ displays: [DisplayOutputSnapshot]) {}
+    func recoveryPresence(for display: DisplayOutputSnapshot) throws -> DisplayRecoveryPresence { .unknown }
+    func forgetRecovery(uuid: String) {}
 }

@@ -34,7 +34,8 @@ class XCTestCase {}
             tests.testMinimumBrightnessRequiresAnUnrestrictedExternalWhenPoliciesAreActive,
             tests.testUnpluggedOwnedDisplayWaitsForFreshIdentityWithoutRestoringStaleID,
             tests.testLegacyInactiveUSBDisplayCanBeRecognizedWithoutBypassingRestriction,
-            tests.testLegacyModelCountsIncludeOnlyOwnedAndConfirmedDisabledDisplays
+            tests.testLegacyModelCountsIncludeOnlyOwnedAndConfirmedDisabledDisplays,
+            tests.testReenforcementRefreshesDurableIDAndLoginScope
         ]
         for check in checks { do { try check() } catch { failures += 1; print("FAIL: \(error)") } }
         print("Display restrictions: \(checks.count) checks, \(failures) failures")
@@ -67,6 +68,7 @@ final class DisplayRestrictionSessionTests: XCTestCase {
         try session.start()
         try session.setRestricted(.hdmi, true)
         backend.displays.removeAll { $0.uuid == "hdmi" }
+        backend.presence["hdmi"] = .disconnected
         try session.reconcile()
         XCTAssertEqual(session.settings.hdmi, true)
         backend.displays.append(restrictionDisplay(42, "replacement", .hdmi))
@@ -300,9 +302,11 @@ final class DisplayRestrictionSessionTests: XCTestCase {
         try session.start()
         try session.setRestricted(.hdmi, true)
         backend.displays.removeAll { $0.uuid == "hdmi" }
+        backend.presence["hdmi"] = .disconnected
         XCTAssertEqual(restrictionError { try session.setRestricted(.hdmi, false) } == nil, true)
         XCTAssertEqual(store.saved?.disabled.map(\.uuid), ["hdmi"])
         backend.displays.append(restrictionDisplay(99, "hdmi", .hdmi, enabled: false))
+        backend.presence["hdmi"] = .connected
         try session.reconcile()
         XCTAssertEqual(backend.enabled("hdmi"), true)
         XCTAssertEqual(backend.writes.last?.id, 99)
@@ -345,11 +349,26 @@ final class DisplayRestrictionSessionTests: XCTestCase {
         // A durable journal entry alone is insufficient if output is still active.
         XCTAssertEqual(session.ownedModels.isEmpty, true)
     }
+
+    func testReenforcementRefreshesDurableIDAndLoginScope() throws {
+        let backend = RestrictionTestBackend()
+        let store = RestrictionTestStore()
+        backend.displays[1] = restrictionDisplay(10, "hdmi", .hdmi, recoveryScope: "old-login")
+        let session = DisplayRestrictionSession(backend: backend, store: store)
+        try session.start()
+        try session.setRestricted(.hdmi, true)
+        backend.displays[1] = restrictionDisplay(99, "hdmi", .hdmi, recoveryScope: "current-login")
+        try session.reconcile()
+        XCTAssertEqual(store.saved?.disabled.first?.id, 99)
+        XCTAssertEqual(store.saved?.disabled.first?.recoveryScope, "current-login")
+    }
 }
 
 private func restrictionDisplay(_ id: UInt32, _ uuid: String, _ port: DisplayOutputPort?, builtin: Bool = false,
-                                enabled: Bool = true, model: DisplayOutputModel? = nil) -> DisplayOutputSnapshot {
-    DisplayOutputSnapshot(id: id, uuid: uuid, name: uuid, isBuiltin: builtin, isEnabled: enabled, port: port, model: model)
+                                enabled: Bool = true, model: DisplayOutputModel? = nil,
+                                recoveryScope: String? = nil) -> DisplayOutputSnapshot {
+    DisplayOutputSnapshot(id: id, uuid: uuid, name: uuid, isBuiltin: builtin, isEnabled: enabled,
+                          port: port, model: model, recoveryScope: recoveryScope)
 }
 private func restrictionError(_ action: () throws -> Void) -> Error? {
     do { try action(); return nil } catch { return error }
@@ -366,6 +385,10 @@ private final class RestrictionTestBackend: DisplayOutputBackend {
     var snapshotCount = 0
     var beforeSnapshot: ((Int) -> Void)?
     var hidden: [String: DisplayOutputSnapshot] = [:]
+    var presence: [String: DisplayRecoveryPresence] = [:]
+    func recoveryPresence(for display: DisplayOutputSnapshot) throws -> DisplayRecoveryPresence {
+        presence[display.uuid] ?? .unknown
+    }
     func remember(_ records: [DisplayOutputSnapshot]) {
         for record in records {
             guard let known = hidden[record.uuid], known.id == record.id else { continue }
@@ -387,7 +410,8 @@ private final class RestrictionTestBackend: DisplayOutputBackend {
             throw RestrictionTestError.unavailable
         }
         displays[index] = restrictionDisplay(display.id, display.uuid, display.port,
-                                              builtin: display.isBuiltin, enabled: enabled, model: display.model)
+                                              builtin: display.isBuiltin, enabled: enabled, model: display.model,
+                                              recoveryScope: display.recoveryScope)
         if !enabled { afterDisable?(display.uuid) }
     }
     func enabled(_ uuid: String) -> Bool { displays.first { $0.uuid == uuid }?.isEnabled ?? false }

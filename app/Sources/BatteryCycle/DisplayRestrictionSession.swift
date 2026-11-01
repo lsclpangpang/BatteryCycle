@@ -20,6 +20,7 @@ struct DisplayRestrictionRecord: Codable, Equatable {
     let name: String
     let port: DisplayOutputPort
     let model: DisplayOutputModel?
+    let recoveryScope: String?
 
     init(_ display: DisplayOutputSnapshot, port: DisplayOutputPort) {
         id = display.id
@@ -27,10 +28,12 @@ struct DisplayRestrictionRecord: Codable, Equatable {
         name = display.name
         self.port = port
         model = display.model
+        recoveryScope = display.recoveryScope
     }
 
     var snapshot: DisplayOutputSnapshot {
-        DisplayOutputSnapshot(id: id, uuid: uuid, name: name, isBuiltin: false, isEnabled: false, port: port, model: model)
+        DisplayOutputSnapshot(id: id, uuid: uuid, name: name, isBuiltin: false, isEnabled: false,
+                              port: port, model: model, recoveryScope: recoveryScope, isConfirmedEnabled: false)
     }
 }
 
@@ -56,6 +59,7 @@ final class DisplayRestrictionSession {
     private var loaded = false
     private var firstAttemptAt: [String: TimeInterval] = [:]
     private var lastAttemptAt: [String: TimeInterval] = [:]
+    private var lastRestoreAt: [String: TimeInterval] = [:]
 
     var settings: DisplayRestrictionSettings { state.settings }
     var hasRecovery: Bool { !state.disabled.isEmpty }
@@ -64,8 +68,10 @@ final class DisplayRestrictionSession {
         guard loaded, !state.disabled.isEmpty, let topology = try? backend.snapshot() else { return [:] }
         var models: [DisplayOutputModel: Int] = [:]
         for record in state.disabled {
-            guard let display = topology.first(where: { $0.uuid == record.uuid && !$0.isEnabled }),
-                  let model = display.model ?? record.model, model.vendor != 0, model.product != 0 else { continue }
+            let display = topology.first(where: { $0.uuid == record.uuid })
+            if let display, confirmedEnabled(display) { continue }
+            if display == nil, (try? backend.recoveryPresence(for: record.snapshot)) != .connected { continue }
+            guard let model = display?.model ?? record.model, model.vendor != 0, model.product != 0 else { continue }
             models[model, default: 0] += 1
         }
         return models
@@ -101,7 +107,14 @@ final class DisplayRestrictionSession {
         var errors: [String] = []
 
         for record in state.disabled {
-            guard let current = topology.first(where: { $0.uuid == record.uuid }) else { continue }
+            guard let current = topology.first(where: { $0.uuid == record.uuid }) else {
+                guard !state.settings[record.port] else { continue }
+                do {
+                    if try backend.recoveryPresence(for: record.snapshot) == .disconnected { continue }
+                    try restore(record, using: record.snapshot)
+                } catch { errors.append(error.localizedDescription) }
+                continue
+            }
             if current.port == nil, state.settings.isActive {
                 errors.append("无法确认「\(record.name)」当前连接的接口，暂未恢复输出")
                 continue
@@ -145,8 +158,11 @@ final class DisplayRestrictionSession {
         let topology = try backend.snapshot()
         var errors: [String] = []
         for record in state.disabled {
-            guard let current = topology.first(where: { $0.uuid == record.uuid }) else { continue }
-            do { try restore(record, using: current) }
+            do {
+                let current = topology.first(where: { $0.uuid == record.uuid })
+                if current == nil, try backend.recoveryPresence(for: record.snapshot) == .disconnected { continue }
+                try restore(record, using: current ?? record.snapshot)
+            }
             catch { errors.append(error.localizedDescription) }
         }
         if !errors.isEmpty { throw RestrictionError(errors.joined(separator: "；")) }
@@ -184,8 +200,10 @@ final class DisplayRestrictionSession {
               saved.disabled.allSatisfy({ !$0.uuid.isEmpty && $0.id != 0 }) else {
             throw RestrictionError("屏幕恢复记录无效，未更改显示器设置")
         }
+        let removed = Set(state.disabled.map(\.uuid)).subtracting(saved.disabled.map(\.uuid))
         state = saved
         loaded = true
+        for uuid in removed { backend.forgetRecovery(uuid: uuid) }
         backend.remember(saved.disabled.map(\.snapshot))
     }
 
@@ -215,9 +233,16 @@ final class DisplayRestrictionSession {
             ($0.isBuiltin || $0.port.map { !state.settings[$0] } == true) }) else {
             throw RestrictionError("需保留一块可用屏幕，已暂停停止外接屏输出")
         }
-        if !state.disabled.contains(where: { $0.uuid == display.uuid }) {
+        let captured = DisplayRestrictionRecord(display, port: port)
+        if let index = state.disabled.firstIndex(where: { $0.uuid == display.uuid }) {
+            if state.disabled[index] != captured {
+                var next = state
+                next.disabled[index] = captured
+                try commit(next)
+            }
+        } else {
             var next = state
-            next.disabled.append(DisplayRestrictionRecord(display, port: port))
+            next.disabled.append(captured)
             try commit(next)
         }
         if firstAttemptAt[display.uuid] == nil { firstAttemptAt[display.uuid] = now }
@@ -236,19 +261,32 @@ final class DisplayRestrictionSession {
     }
 
     private func restore(_ record: DisplayRestrictionRecord, using display: DisplayOutputSnapshot) throws {
-        if !display.isEnabled {
-            do { try backend.setEnabled(true, for: display) }
+        if !confirmedEnabled(display) {
+            let now = uptime()
+            if let last = lastRestoreAt[record.uuid], now - last < 3 {
+                throw RestrictionError("正在等待「\(record.name)」恢复画面，请稍候")
+            }
+            do {
+                try backend.setEnabled(true, for: display)
+                lastRestoreAt[record.uuid] = now
+            }
             catch { throw RestrictionError("无法恢复「\(record.name)」：\(error.localizedDescription)") }
         }
         let after = try backend.snapshot()
-        guard after.contains(where: { $0.uuid == record.uuid && $0.isEnabled }) else {
+        guard after.contains(where: { $0.uuid == record.uuid && confirmedEnabled($0) }) else {
             throw RestrictionError("尚未确认「\(record.name)」已恢复，请稍后重试")
         }
         var next = state
         next.disabled.removeAll { $0.uuid == record.uuid }
         try commit(next)
+        backend.forgetRecovery(uuid: record.uuid)
         firstAttemptAt[record.uuid] = nil
         lastAttemptAt[record.uuid] = nil
+        lastRestoreAt[record.uuid] = nil
+    }
+
+    private func confirmedEnabled(_ display: DisplayOutputSnapshot) -> Bool {
+        display.isConfirmedEnabled ?? display.isEnabled
     }
 
     private struct RestrictionError: LocalizedError {

@@ -2,11 +2,14 @@ import CoreGraphics
 import ColorSync
 import Foundation
 import IOKit
+import Security
+import Darwin
 
 /// User-session display configuration only. Never disables USB controllers, power
 /// delivery or data paths. All callers serialize access on the main thread.
 final class NativeDisplayOutputBackend: DisplayOutputBackend {
     private var remembered: [String: DisplayOutputSnapshot] = [:]
+    private var trustedDisabledIDs: [String: UInt32] = [:]
     private var knownPhysicalPorts: Set<String> = []
     private var reasons: [UInt32: String] = [:]
 
@@ -14,6 +17,18 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
         for display in displays where !display.isBuiltin && UUID(uuidString: display.uuid) != nil {
             remembered[display.uuid] = display
         }
+    }
+
+    func forgetRecovery(uuid: String) {
+        remembered.removeValue(forKey: uuid)
+        trustedDisabledIDs.removeValue(forKey: uuid)
+    }
+
+    func recoveryPresence(for display: DisplayOutputSnapshot) throws -> DisplayRecoveryPresence {
+        guard let port = display.port else { return .unknown }
+        let first = physicalInventory()
+        let second = physicalInventory()
+        return Self.presence(port: port, inventory: second, stable: first == second && second.complete)
     }
 
     func snapshot() throws -> [DisplayOutputSnapshot] {
@@ -33,6 +48,7 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
         let after = physicalInventory()
         let inventoryStable = before == after && after.complete
         let linksStable = linksBefore == linksAfter && linksAfter.complete
+        let scope = Self.currentRecoveryScope()
         reasons = [:]
         var result: [DisplayOutputSnapshot] = []
         for id in ids {
@@ -62,10 +78,15 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
                 inventory: after.entries.map { .init(kind: $0.kind, connection: $0.connection) },
                 inventoryComplete: inventoryStable,
                 transportUpstream: framebuffer?.upstream, transportDownstream: framebuffer?.downstream))
-            let enabled = DisplayOutputPresence.isEnabled(
-                active: CGDisplayIsActive(id) != 0,
-                mirrored: CGDisplayIsInMirrorSet(id) != 0 || CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay,
-                asleep: CGDisplayIsAsleep(id) != 0)
+            let active = CGDisplayIsActive(id) != 0
+            let mirrorPrimary = CGDisplayMirrorsDisplay(id)
+            let mirrored = CGDisplayIsInMirrorSet(id) != 0 || mirrorPrimary != kCGNullDirectDisplay
+            let asleep = CGDisplayIsAsleep(id) != 0
+            let enabled = DisplayOutputPresence.isEnabled(active: active, mirrored: mirrored, asleep: asleep)
+            let confirmedEnabled = DisplayRecoveryVerification.isConfirmed(active: active, mirrored: mirrored,
+                mirrorPrimaryActive: mirrorPrimary != kCGNullDirectDisplay && mirrorPrimary != id
+                    && CGDisplayIsActive(mirrorPrimary) != 0 && CGDisplayIsOnline(id) != 0,
+                asleep: asleep)
             let names = info["DisplayProductName"] as? [String: String]
             let name = names?["zh_CN"] ?? names?["en_US"] ?? names?.values.first
                 ?? (builtin ? "内置显示器" : "外接显示器")
@@ -73,23 +94,26 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
                 ? DisplayOutputModel(vendor: identity.vendor, product: identity.product) : nil
             result.append(.init(id: id, uuid: uuid, name: name, isBuiltin: builtin,
                                 isEnabled: enabled, port: builtin ? nil : classification.port,
-                                model: model))
+                                model: model, recoveryScope: scope, isConfirmedEnabled: confirmedEnabled))
             reasons[id] = builtin ? "内置屏幕" : classification.reason
         }
         let visibleUUIDs = Set(result.map(\.uuid))
         for record in remembered.values where !visibleUUIDs.contains(record.uuid) {
-            // Offline records are useful only while the OS still confirms the
-            // UUID. An old numeric ID may have been recycled after hot-plug/login.
-            guard let id = Self.resolve(record.uuid, previousID: record.id) else { continue }
+            if let port = record.port,
+               Self.presence(port: port, inventory: after, stable: inventoryStable) == .disconnected { continue }
+            // Logical disabling may make both CG UUID APIs return nothing. Keep
+            // an owned same-session recovery candidate rather than losing it.
+            guard let id = try recoveryID(for: record, enabling: true, onlineIDs: ids) else { continue }
             result.append(.init(id: id, uuid: record.uuid, name: record.name, isBuiltin: false,
-                                isEnabled: false, port: record.port, model: record.model))
-            reasons[id] = "本 App 停用记录，系统仍确认 UUID，当前不在在线列表"
+                                isEnabled: false, port: record.port, model: record.model,
+                                recoveryScope: record.recoveryScope, isConfirmedEnabled: false))
+            reasons[id] = "本 App 拥有的同登录会话恢复候选，尚未确认输出"
         }
         return result.sorted { $0.id < $1.id }
     }
 
     func setEnabled(_ enabled: Bool, for display: DisplayOutputSnapshot) throws {
-        guard !display.isBuiltin, let id = Self.resolve(display.uuid, previousID: display.id),
+        guard !display.isBuiltin, let id = try recoveryID(for: display, enabling: enabled),
               CGDisplayIsBuiltin(id) == 0 else { throw NativeDisplayOutputError.changedIdentity }
         var current = display
         if !enabled {
@@ -118,12 +142,14 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
         guard completed == .success else {
             throw NativeDisplayOutputError.operation("提交显示配置", Int32(completed.rawValue))
         }
-        if enabled {
-            remembered.removeValue(forKey: display.uuid)
-        } else {
+        if !enabled {
+            trustedDisabledIDs[display.uuid] = id
             remembered[display.uuid] = .init(id: id, uuid: display.uuid, name: current.name,
-                isBuiltin: false, isEnabled: false, port: current.port, model: current.model)
+                isBuiltin: false, isEnabled: false, port: current.port, model: current.model,
+                recoveryScope: current.recoveryScope, isConfirmedEnabled: false)
         }
+        // Re-enable submission must retain ownership until the policy engine
+        // observes the real online UUID + confirmed output and calls forgetRecovery.
         // A successful call only submits configuration. The policy engine must
         // inspect subsequent snapshots instead of treating this as verification.
     }
@@ -144,6 +170,18 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
     private struct Inventory: Equatable {
         let entries: [PhysicalEntry]
         let complete: Bool
+    }
+
+    private static func presence(port: DisplayOutputPort, inventory: Inventory,
+                                 stable: Bool) -> DisplayRecoveryPresence {
+        let connections = inventory.entries.filter { $0.kind == port }.map { entry -> DisplayRecoveryPresence in
+            switch entry.connection {
+            case .connected: return .connected
+            case .disconnected: return .disconnected
+            case .unknown: return .unknown
+            }
+        }
+        return DisplayRecoveryVerification.presence(connections, stable: stable)
     }
 
     private func physicalInventory() -> Inventory {
@@ -332,6 +370,45 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
     private static func uuid(_ id: CGDirectDisplayID) -> String? {
         guard let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else { return nil }
         return CFUUIDCreateString(kCFAllocatorDefault, uuid) as String
+    }
+
+    private func recoveryID(for display: DisplayOutputSnapshot, enabling: Bool,
+                            onlineIDs suppliedIDs: [UInt32]? = nil) throws -> UInt32? {
+        guard UUID(uuidString: display.uuid) != nil else { return nil }
+        let ids = try suppliedIDs ?? Self.onlineDisplays()
+        var knownUUIDs: [UInt32: String] = [:]
+        for id in ids {
+            if let uuid = Self.uuid(id) { knownUUIDs[id] = uuid }
+        }
+        if let previousUUID = Self.uuid(display.id) { knownUUIDs[display.id] = previousUUID }
+        let owned = remembered[display.uuid]
+        return DisplayRecoveryResolver.resolve(enabling: enabling, previousID: display.id,
+            expectedUUID: display.uuid,
+            verifiedUUIDDisplayID: Self.resolve(display.uuid, previousID: display.id),
+            knownUUIDs: knownUUIDs, onlineIDs: Set(ids),
+            trustedInProcess: trustedDisabledIDs[display.uuid] == display.id,
+            rememberedOwned: owned?.id == display.id && owned?.uuid == display.uuid
+                && owned?.recoveryScope == display.recoveryScope,
+            savedScope: display.recoveryScope, currentScope: Self.currentRecoveryScope())
+    }
+
+    /// Security session IDs are login-scoped; the boot UUID prevents reuse after
+    /// reboot. This is an informational read and never requests authorization.
+    private static func currentRecoveryScope() -> String? {
+        var size = 0
+        guard sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0,
+              size > 1, size < 256 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        let status = buffer.withUnsafeMutableBufferPointer {
+            sysctlbyname("kern.bootsessionuuid", $0.baseAddress, &size, nil, 0)
+        }
+        guard status == 0 else { return nil }
+        let boot = String(cString: buffer)
+        guard UUID(uuidString: boot) != nil else { return nil }
+        var session: SecuritySessionId = noSecuritySession
+        guard SessionGetInfo(callerSecuritySession, &session, nil) == errSecSuccess,
+              session != noSecuritySession, session != callerSecuritySession else { return nil }
+        return "\(boot.lowercased()):\(session)"
     }
 
     private static func resolve(_ uuid: String, previousID: UInt32) -> UInt32? {

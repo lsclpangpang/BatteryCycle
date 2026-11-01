@@ -8,17 +8,26 @@ xcrun swiftc -parse-as-library -D DISPLAY_RESTRICTIONS_STANDALONE \
     Sources/BatteryCycle/DisplayOutputBackend.swift Sources/BatteryCycle/DisplayRestrictionSession.swift \
     Tests/BatteryCycleTests/DisplayRestrictionSessionTests.swift -o "$OUT/session-checks"
 "$OUT/session-checks"
+xcrun swiftc -parse-as-library -D DISPLAY_RESTORATION_STANDALONE \
+    Sources/BatteryCycle/DisplayOutputBackend.swift Sources/BatteryCycle/DisplayRestrictionSession.swift \
+    Tests/BatteryCycleTests/DisplayRestorationTests.swift -o "$OUT/restoration-checks"
+"$OUT/restoration-checks"
 xcrun swiftc -parse-as-library -D DISPLAY_TRANSPORT_STANDALONE \
     Sources/BatteryCycle/DisplayOutputBackend.swift Sources/BatteryCycle/DisplayTransport.swift \
     Tests/BatteryCycleTests/DisplayTransportTests.swift -o "$OUT/transport-checks"
 "$OUT/transport-checks"
+xcrun swiftc -parse-as-library -D DISPLAY_RECOVERY_STANDALONE \
+    Sources/BatteryCycle/DisplayOutputBackend.swift Sources/BatteryCycle/DisplayRecoveryResolver.swift \
+    Tests/BatteryCycleTests/DisplayRecoveryResolverTests.swift -o "$OUT/recovery-resolver-checks"
+"$OUT/recovery-resolver-checks"
 xcrun swiftc -parse-as-library -D ADVANCED_ACCESS_STANDALONE \
     Sources/BatteryCycle/AdminAuthorization.swift Sources/BatteryCycle/AdvancedAccessController.swift \
     Tests/BatteryCycleTests/AdvancedAccessTests.swift -o "$OUT/access-checks"
 "$OUT/access-checks"
 xcrun swiftc -parse-as-library -D DISPLAY_RESTRICTION_CONTROLLER_STANDALONE \
     Sources/BatteryCycle/DisplayOutputBackend.swift Sources/BatteryCycle/DisplayTransport.swift \
-    Sources/BatteryCycle/NativeDisplayOutputBackend.swift Sources/BatteryCycle/DisplayRestrictionSession.swift \
+    Sources/BatteryCycle/DisplayRecoveryResolver.swift Sources/BatteryCycle/NativeDisplayOutputBackend.swift \
+    Sources/BatteryCycle/DisplayRestrictionSession.swift \
     Sources/BatteryCycle/FileDisplayRestrictionStore.swift Sources/BatteryCycle/DisplayOutputRestrictionController.swift \
     Tests/BatteryCycleTests/DisplayRestrictionControllerTests.swift -o "$OUT/controller-checks"
 "$OUT/controller-checks"
