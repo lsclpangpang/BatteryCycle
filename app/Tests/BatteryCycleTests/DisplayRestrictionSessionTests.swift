@@ -20,7 +20,8 @@ class XCTestCase {}
             tests.testJournalFailurePreventsHardwareChange,
             tests.testRestoreFailureRetainsRecoveryRecord,
             tests.testRestartRecoversDisabledDisplayWhenPolicyIsOff,
-            tests.testTerminationRestoresOwnedDisplaysWithoutForgettingPolicy,
+            tests.testTerminationKeepsRestrictedDisplaysAndRestoresReleasedOnes,
+            tests.testTerminationKeepsDisplayWithUnknownInterfaceWhilePolicyRemains,
             tests.testMovedDisplayIsRestoredUnderUnrestrictedPort,
             tests.testAcceptedConfigurationStillRequiresObservedChange,
             tests.testUnavailableSnapshotNeverChangesHardware,
@@ -28,7 +29,9 @@ class XCTestCase {}
             tests.testUnknownTransportDoesNotHideKnownTargetErrors,
             tests.testMovedUnknownInterfaceIsNotRestoredWhileAnyPolicyRemains,
             tests.testSurvivorIsCheckedAgainBeforeEachDisable,
-            tests.testUnreadablePolicyDoesNotPermitLegacyEnable,
+            tests.testUnreadablePolicyDoesNotLockLegacyEnable,
+            tests.testLegacyIdentityNeedsNoTransportWhileNoRestrictionIsOn,
+            tests.testLegacyIdentityIsNotKeptAsRecoveryCandidate,
             tests.testUncertainSaveIsReloadedBeforeChangingOtherSwitch,
             tests.testTargetIsRevalidatedImmediatelyBeforeDisable,
             tests.testMinimumBrightnessRequiresAnUnrestrictedExternalWhenPoliciesAreActive,
@@ -153,19 +156,22 @@ final class DisplayRestrictionSessionTests: XCTestCase {
         XCTAssertEqual(store.saved?.disabled.isEmpty, true)
     }
 
-    func testTerminationRestoresOwnedDisplaysWithoutForgettingPolicy() throws {
+    func testTerminationKeepsRestrictedDisplaysAndRestoresReleasedOnes() throws {
         let backend = RestrictionTestBackend()
         let store = RestrictionTestStore()
         let session = DisplayRestrictionSession(backend: backend, store: store)
         try session.start()
         try session.setRestricted(.hdmi, true)
         try session.setRestricted(.usbC, true)
-        try session.restoreAll()
-        XCTAssertEqual(backend.enabled("hdmi"), true)
+        backend.failRestore = true
+        XCTAssertEqual(restrictionError { try session.setRestricted(.usbC, false) } != nil, true)
+        backend.failRestore = false
+        try session.restoreReleased()
+        XCTAssertEqual(backend.enabled("hdmi"), false)
         XCTAssertEqual(backend.enabled("usb"), true)
         XCTAssertEqual(store.saved?.settings.hdmi, true)
-        XCTAssertEqual(store.saved?.settings.usbC, true)
-        XCTAssertEqual(store.saved?.disabled.isEmpty, true)
+        XCTAssertEqual(store.saved?.settings.usbC, false)
+        XCTAssertEqual(store.saved?.disabled.map(\.uuid), ["hdmi"])
     }
 
     func testMovedDisplayIsRestoredUnderUnrestrictedPort() throws {
@@ -244,13 +250,55 @@ final class DisplayRestrictionSessionTests: XCTestCase {
         XCTAssertEqual(backend.enabled("usb"), true)
     }
 
-    func testUnreadablePolicyDoesNotPermitLegacyEnable() throws {
+    func testTerminationKeepsDisplayWithUnknownInterfaceWhilePolicyRemains() throws {
+        let backend = RestrictionTestBackend()
+        let store = RestrictionTestStore()
+        let session = DisplayRestrictionSession(backend: backend, store: store)
+        try session.start()
+        try session.setRestricted(.hdmi, true)
+        try session.setRestricted(.usbC, true)
+        backend.failRestore = true
+        XCTAssertEqual(restrictionError { try session.setRestricted(.hdmi, false) } != nil, true)
+        XCTAssertEqual(session.hasReleasedRecovery, true)
+        backend.failRestore = false
+        backend.displays[1] = restrictionDisplay(10, "hdmi", nil, enabled: false)
+        try session.restoreReleased()
+        XCTAssertEqual(backend.enabled("hdmi"), false)
+        XCTAssertEqual(store.saved?.disabled.map(\.uuid).sorted(), ["hdmi", "usb"])
+    }
+
+    func testUnreadablePolicyDoesNotLockLegacyEnable() throws {
         let backend = RestrictionTestBackend()
         let store = RestrictionTestStore()
         store.failLoad = true
         let session = DisplayRestrictionSession(backend: backend, store: store)
         XCTAssertEqual(restrictionError { try session.start() } != nil, true)
-        XCTAssertEqual(session.permitsEnabling(displayID: 10), false)
+        // Deleting the journal would have the same effect; never strand the legacy switch.
+        XCTAssertEqual(session.permitsEnabling(displayID: 10), true)
+        XCTAssertEqual(session.permitsMinimumBrightness(), true)
+        XCTAssertEqual(backend.writes.isEmpty, true)
+    }
+
+    func testLegacyIdentityNeedsNoTransportWhileNoRestrictionIsOn() throws {
+        let backend = RestrictionTestBackend()
+        let session = DisplayRestrictionSession(backend: backend, store: RestrictionTestStore())
+        try session.start()
+        let identity = session.captureIdentity(displayID: 10)
+        // A disabled display usually loses the framebuffer evidence used to classify it.
+        backend.displays[1] = restrictionDisplay(10, "hdmi", nil, enabled: false)
+        XCTAssertEqual(session.permitsEnabling(displayID: 10, identity: identity), true)
+        backend.failSnapshot = true
+        XCTAssertEqual(session.permitsEnabling(displayID: 10, identity: identity), true)
+    }
+
+    func testLegacyIdentityIsNotKeptAsRecoveryCandidate() throws {
+        let backend = RestrictionTestBackend()
+        let session = DisplayRestrictionSession(backend: backend, store: RestrictionTestStore())
+        try session.start()
+        let identity = session.captureIdentity(displayID: 11)
+        try session.setRestricted(.hdmi, true)
+        _ = session.permitsEnabling(displayID: 11, identity: identity)
+        XCTAssertEqual(backend.forgotten, ["usb"])
     }
 
     func testUncertainSaveIsReloadedBeforeChangingOtherSwitch() throws {
@@ -386,6 +434,8 @@ private final class RestrictionTestBackend: DisplayOutputBackend {
     var beforeSnapshot: ((Int) -> Void)?
     var hidden: [String: DisplayOutputSnapshot] = [:]
     var presence: [String: DisplayRecoveryPresence] = [:]
+    var forgotten: [String] = []
+    func forgetRecovery(uuid: String) { forgotten.append(uuid) }
     func recoveryPresence(for display: DisplayOutputSnapshot) throws -> DisplayRecoveryPresence {
         presence[display.uuid] ?? .unknown
     }

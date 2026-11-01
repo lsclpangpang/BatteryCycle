@@ -22,7 +22,8 @@ class XCTestCase {}
             ("rejected restore", tests.testRejectedConnectedRestoreReportsFailureAndPreservesJournal),
             ("acknowledgement without output", tests.testAcceptedRestoreWaitsForConfirmedOutputBeforeForgetting),
             ("asleep is not confirmation", tests.testAsleepOnlyDisplayIsActivelyRestored),
-            ("termination recovery", tests.testRestoreAllRecoversConnectedMissingIdentity),
+            ("termination recovery", tests.testRestoreReleasedRecoversConnectedMissingIdentity),
+            ("termination keeps restriction", tests.testRestoreReleasedKeepsActiveRestriction),
             ("off intent survives failure", tests.testPendingRestorationKeepsOffIntent),
             ("known ID reuse is rejected", tests.testReusedCGDisplayIDCannotBeRestoredAsOriginalDevice)
         ]
@@ -141,17 +142,31 @@ final class DisplayRestorationTests: XCTestCase {
         XCTAssertEqual(backend.forgotten, [RestorationBackend.hdmiUUID])
     }
 
-    func testRestoreAllRecoversConnectedMissingIdentity() throws {
+    func testRestoreReleasedRecoversConnectedMissingIdentity() throws {
         let backend = RestorationBackend()
         let store = RestorationStore()
         let session = DisplayRestrictionSession(backend: backend, store: store)
         try session.start()
         try session.setRestricted(.hdmi, true)
-        try session.restoreAll()
-        XCTAssertEqual(backend.enableAttempts.count, 1)
+        backend.result = .reject
+        XCTAssertEqual(restorationError { try session.setRestricted(.hdmi, false) } != nil, true)
+        backend.result = .returnConfirmedOutput
+        try session.restoreReleased()
+        XCTAssertEqual(backend.enableAttempts.count, 2)
         XCTAssertEqual(backend.confirmedHDMI, true)
         XCTAssertEqual(store.saved?.disabled.isEmpty, true)
         XCTAssertEqual(backend.forgotten, [RestorationBackend.hdmiUUID])
+    }
+
+    func testRestoreReleasedKeepsActiveRestriction() throws {
+        let backend = RestorationBackend()
+        let store = RestorationStore()
+        let session = DisplayRestrictionSession(backend: backend, store: store)
+        try session.start()
+        try session.setRestricted(.hdmi, true)
+        try session.restoreReleased()
+        XCTAssertEqual(backend.enableAttempts.isEmpty, true, "quitting must not lift an active restriction")
+        XCTAssertEqual(store.saved?.disabled.map(\.uuid), [RestorationBackend.hdmiUUID])
         XCTAssertEqual(session.settings.hdmi, true, "normal exit preserves the next-launch preference")
     }
 

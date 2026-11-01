@@ -16,6 +16,8 @@ final class DisplayOutputRestrictionController: ObservableObject {
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     private var timer: Timer?
     private var pendingCheck: DispatchWorkItem?
+    private var lastCheckAt: TimeInterval = 0
+    private var lastTriggerAt: TimeInterval = 0
 
     init(backend: any DisplayOutputBackend = NativeDisplayOutputBackend(),
          store: any DisplayRestrictionStoring = FileDisplayRestrictionStore(),
@@ -36,7 +38,7 @@ final class DisplayOutputRestrictionController: ObservableObject {
         observe(.default, NSApplication.didChangeScreenParametersNotification) { $0.scheduleCheck() }
         observe(.default, NSApplication.willTerminateNotification) { $0.prepareForTermination() }
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.check() }
+            MainActor.assumeIsolated { self?.pollIfDue() }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
@@ -56,8 +58,11 @@ final class DisplayOutputRestrictionController: ObservableObject {
         check(force: true)
     }
 
+    /// Without the lease another copy enforces the journal (or nothing can), so the
+    /// legacy switch is not locked out by this copy.
     func permitsLegacyEnabling(displayID: UInt32, identity: DisplayRestrictionRecord? = nil) -> Bool {
-        guard ownsControl, !terminating else { return false }
+        guard !terminating else { return false }
+        guard ownsControl else { return true }
         return session.permitsEnabling(displayID: displayID, identity: identity)
     }
 
@@ -72,12 +77,13 @@ final class DisplayOutputRestrictionController: ObservableObject {
     }
 
     func permitsMinimumBrightness() -> Bool {
-        ownsControl && !terminating && session.permitsMinimumBrightness()
+        !terminating && (!ownsControl || session.permitsMinimumBrightness())
     }
 
     func check(force: Bool = false) {
         guard !terminating, !systemAsleep, !screensAsleep,
               ownsControl, force || settings.isActive || session.hasRecovery || session.needsReload else { return }
+        lastCheckAt = ProcessInfo.processInfo.systemUptime
         do { try session.reconcile(); message = nil }
         catch { message = error.localizedDescription }
         publish()
@@ -99,7 +105,7 @@ final class DisplayOutputRestrictionController: ObservableObject {
         pendingCheck = nil
         timer?.invalidate()
         if ownsControl {
-            do { try session.restoreAll(); message = nil }
+            do { try session.restoreReleased(); message = nil }
             catch { message = error.localizedDescription }
             lease?.release()
             ownsControl = false
@@ -119,7 +125,22 @@ final class DisplayOutputRestrictionController: ObservableObject {
 
     private func publish() { settings = session.settings }
 
+    /// Each check reads the IOKit registry several times on the main thread. Screen changes and
+    /// wake already schedule one, so poll quickly only while an attempt awaits confirmation or a
+    /// just-attached display's interface is still settling, every few seconds while a released
+    /// display awaits replug or an error is shown, and otherwise as a rare safety net.
+    private func pollIfDue() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let settling = session.hasUncertainTransport && now - lastTriggerAt < 10
+        let interval: TimeInterval = session.hasPendingAttempts || session.needsReload || settling ? 1
+            : session.hasReleasedRecovery ? 3
+            : message != nil ? 5 : 30
+        guard now - lastCheckAt >= interval else { return }
+        check()
+    }
+
     private func scheduleCheck() {
+        lastTriggerAt = ProcessInfo.processInfo.systemUptime
         guard pendingCheck == nil, !terminating, !systemAsleep, !screensAsleep else { return }
         let pending = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {

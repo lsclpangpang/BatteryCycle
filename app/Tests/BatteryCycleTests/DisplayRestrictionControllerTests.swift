@@ -15,7 +15,7 @@ class XCTestCase {}
         tests.testSleepSuspendsPolicyAndFullyAwakeReappliesIt()
         tests.testTemporaryStartupReadFailureIsRetriedWithoutOverwritingSavedPolicy()
         tests.testSecondCopyCannotChangeJournalUntilLeaseIsAvailable()
-        tests.testTerminationRestoresAndPreventsQueuedPolicyWrites()
+        tests.testTerminationKeepsPolicyAndPreventsQueuedPolicyWrites()
         print("Display restriction controller: 5 checks, \(failures) failures")
         if failures > 0 { exit(1) }
     }
@@ -95,7 +95,7 @@ final class DisplayRestrictionControllerTests: XCTestCase {
         XCTAssertTrue(controller.settings.hdmi)
     }
 
-    @MainActor func testTerminationRestoresAndPreventsQueuedPolicyWrites() {
+    @MainActor func testTerminationKeepsPolicyAndPreventsQueuedPolicyWrites() {
         let backend = OutputControllerBackend()
         let store = OutputControllerStore()
         let lease = OutputControllerLease()
@@ -103,8 +103,9 @@ final class DisplayRestrictionControllerTests: XCTestCase {
             canChangeSettings: { true }, observesSystemEvents: false)
         controller.setRestricted(.hdmi, true)
         controller.prepareForTermination()
-        XCTAssertTrue(backend.displays[1].isEnabled)
+        XCTAssertFalse(backend.displays[1].isEnabled)
         XCTAssertEqual(store.state?.settings.hdmi, true)
+        XCTAssertEqual(store.state?.disabled.map(\.uuid), ["hdmi"])
         XCTAssertTrue(lease.released)
         let count = backend.writeCount
         controller.check(force: true)

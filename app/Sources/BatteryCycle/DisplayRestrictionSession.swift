@@ -64,6 +64,17 @@ final class DisplayRestrictionSession {
     var settings: DisplayRestrictionSettings { state.settings }
     var hasRecovery: Bool { !state.disabled.isEmpty }
     var needsReload: Bool { !loaded }
+    /// A disable or restore was submitted recently and needs a quick follow-up observation.
+    /// Bounded so a display that vanished mid-attempt cannot keep fast polling alive.
+    var hasPendingAttempts: Bool {
+        let now = uptime()
+        return firstAttemptAt.values.contains { now - $0 < 10 } || lastRestoreAt.values.contains { now - $0 < 10 }
+    }
+    /// The last reconcile saw an enabled external display whose interface was not yet known.
+    private(set) var hasUncertainTransport = false
+    /// A display whose restriction is off still awaits restoration, e.g. until it is replugged.
+    /// macOS sends no screen change when a disabled display is replugged, so this needs polling.
+    var hasReleasedRecovery: Bool { state.disabled.contains { !state.settings[$0.port] } }
     var ownedModels: [DisplayOutputModel: Int] {
         guard loaded, !state.disabled.isEmpty, let topology = try? backend.snapshot() else { return [:] }
         var models: [DisplayOutputModel: Int] = [:]
@@ -103,6 +114,7 @@ final class DisplayRestrictionSession {
     /// intent; enforcing previously authorized, persisted intent needs no new prompt.
     func reconcile() throws {
         try load()
+        hasUncertainTransport = false
         var topology = try backend.snapshot()
         var errors: [String] = []
 
@@ -116,6 +128,7 @@ final class DisplayRestrictionSession {
                 continue
             }
             if current.port == nil, state.settings.isActive {
+                hasUncertainTransport = true
                 errors.append("无法确认「\(record.name)」当前连接的接口，暂未恢复输出")
                 continue
             }
@@ -146,20 +159,25 @@ final class DisplayRestrictionSession {
             }
         }
         if state.settings.isActive && topology.contains(where: { !$0.isBuiltin && $0.isEnabled && $0.port == nil }) {
+            hasUncertainTransport = true
             errors.append("部分显示器的接口无法确认，未改动这些显示器")
         }
         if !errors.isEmpty { throw RestrictionError(errors.joined(separator: "；")) }
     }
 
-    /// Normal termination restores only owned changes and preserves both preferences
-    /// for the next launch. Failed restorations keep their journal entries.
-    func restoreAll() throws {
+    /// Normal termination keeps every display whose restriction is still on disabled, so quitting
+    /// is not a way around an authenticated setting; the journal resumes it on the next launch.
+    /// Only owned displays whose restriction was turned off are restored. Failures keep their entries.
+    func restoreReleased() throws {
         try load()
         let topology = try backend.snapshot()
         var errors: [String] = []
         for record in state.disabled {
             do {
                 let current = topology.first(where: { $0.uuid == record.uuid })
+                // Same rule as reconcile: it may have moved to a restricted interface.
+                if let current, current.port == nil, state.settings.isActive { continue }
+                guard !state.settings[current?.port ?? record.port] else { continue }
                 if current == nil, try backend.recoveryPresence(for: record.snapshot) == .disconnected { continue }
                 try restore(record, using: current ?? record.snapshot)
             }
@@ -170,10 +188,17 @@ final class DisplayRestrictionSession {
 
     /// Legacy per-display controls cannot enable a display governed by a restriction.
     /// An uncertain interface also requires resolving the advanced rule first.
+    /// With no restriction on, or an unreadable journal (deleting it has the same effect),
+    /// the legacy switch keeps working on its own.
     func permitsEnabling(displayID: UInt32, identity: DisplayRestrictionRecord? = nil) -> Bool {
-        guard loaded else { return false }
-        if !state.settings.isActive && identity == nil { return true }
-        if let identity { backend.remember([identity.snapshot]) }
+        guard (try? load()) != nil, state.settings.isActive else { return true }
+        // A legacy-disabled display may have left CoreGraphics; seed its identity only for
+        // this lookup so it never becomes a lasting recovery candidate.
+        let borrowed = identity.flatMap { identity in
+            state.disabled.contains(where: { $0.uuid == identity.uuid }) ? nil : identity
+        }
+        if let borrowed { backend.remember([borrowed.snapshot]) }
+        defer { if let borrowed { backend.forgetRecovery(uuid: borrowed.uuid) } }
         guard let topology = try? backend.snapshot(),
               let display = topology.first(where: { $0.id == displayID }),
               identity == nil || display.uuid == identity?.uuid else { return false }
@@ -187,8 +212,7 @@ final class DisplayRestrictionSession {
     }
 
     func permitsMinimumBrightness() -> Bool {
-        guard loaded else { return false }
-        guard state.settings.isActive else { return true }
+        guard (try? load()) != nil, state.settings.isActive else { return true }
         guard let topology = try? backend.snapshot() else { return false }
         return topology.contains { !$0.isBuiltin && $0.isEnabled && $0.port.map { !state.settings[$0] } == true }
     }
@@ -264,7 +288,7 @@ final class DisplayRestrictionSession {
         if !confirmedEnabled(display) {
             let now = uptime()
             if let last = lastRestoreAt[record.uuid], now - last < 3 {
-                throw RestrictionError("正在等待「\(record.name)」恢复画面，请稍候")
+                throw RestrictionError("正在等待「\(record.name)」恢复画面")
             }
             do {
                 try backend.setEnabled(true, for: display)
@@ -274,7 +298,7 @@ final class DisplayRestrictionSession {
         }
         let after = try backend.snapshot()
         guard after.contains(where: { $0.uuid == record.uuid && confirmedEnabled($0) }) else {
-            throw RestrictionError("尚未确认「\(record.name)」已恢复，请稍后重试")
+            throw RestrictionError("正在等待「\(record.name)」恢复画面")
         }
         var next = state
         next.disabled.removeAll { $0.uuid == record.uuid }

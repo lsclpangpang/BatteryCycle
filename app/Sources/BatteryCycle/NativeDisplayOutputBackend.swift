@@ -10,6 +10,8 @@ import Darwin
 final class NativeDisplayOutputBackend: DisplayOutputBackend {
     private var remembered: [String: DisplayOutputSnapshot] = [:]
     private var trustedDisabledIDs: [String: UInt32] = [:]
+    /// Connector numbers seen in this process. Registry-ID fallbacks are excluded: they
+    /// change on re-enumeration and would otherwise mark the inventory incomplete forever.
     private var knownPhysicalPorts: Set<String> = []
     private var reasons: [UInt32: String] = [:]
 
@@ -232,7 +234,7 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
                 entries.append(.init(id: identifier, kind: kind, connection: connection))
             }
         }
-        let observed = Set(entries.map(\.id))
+        let observed = Set(entries.map(\.id).filter { !$0.contains(":registry-") })
         if !knownPhysicalPorts.isSubset(of: observed) { complete = false }
         knownPhysicalPorts.formUnion(observed)
         return Inventory(entries: entries.sorted { $0.id < $1.id }, complete: complete && !entries.isEmpty)
