@@ -25,7 +25,11 @@ class XCTestCase {}
         tests.testPasswordPolicyRejectsWeakerOrUnsupportedRules()
         tests.testPasswordPolicyRejectsAuthenticationBypassFields()
         tests.testGrantMustBeForExactRightAndActuallyAuthorized()
-        print("AdvancedAccess: 12 checks, \(accessFailures) failures")
+        tests.testInvalidHostPreventsAuthenticationRequest()
+        tests.testHostValidationRunsBeforePublishingUnlocked()
+        tests.testCompletionReportsCancellationAndFailureWithoutUnlocking()
+        tests.testLockEventsAreSynchronousAndObserveLockedState()
+        print("AdvancedAccess: 16 checks, \(accessFailures) failures")
         if accessFailures > 0 { exit(1) }
     }
 }
@@ -181,6 +185,63 @@ final class AdvancedAccessTests: XCTestCase {
         XCTAssertTrue(AdminAuthorizationPolicy.acceptsGrantedRight(name: AdminAuthorizationPolicy.rightName, flags: 0))
         XCTAssertFalse(AdminAuthorizationPolicy.acceptsGrantedRight(name: "system.privilege.admin", flags: 0))
         XCTAssertFalse(AdminAuthorizationPolicy.acceptsGrantedRight(name: AdminAuthorizationPolicy.rightName, flags: UInt32(kAuthorizationFlagCanNotPreAuthorize)))
+    }
+
+    @MainActor func testInvalidHostPreventsAuthenticationRequest() {
+        let backend = AccessTestAuthorizer()
+        let controller = AdvancedAccessController(authorizer: backend, observesSystemEvents: false)
+        var result: AdminAuthorizationResult?
+        controller.requestUnlock(isSessionValid: { false }, completion: { result = $0 })
+        XCTAssertEqual(backend.requests, 0)
+        XCTAssertFalse(controller.isUnlocked)
+        XCTAssertFalse(controller.isAuthenticating)
+        XCTAssertEqual(result, .cancelled)
+    }
+
+    @MainActor func testHostValidationRunsBeforePublishingUnlocked() {
+        let backend = AccessTestAuthorizer()
+        let controller = AdvancedAccessController(authorizer: backend, observesSystemEvents: false)
+        var hostShown = true
+        var sawUnlock = false
+        let subscription = controller.$isUnlocked.sink { if $0 { sawUnlock = true } }
+        defer { subscription.cancel() }
+        var result: AdminAuthorizationResult?
+        controller.requestUnlock(isSessionValid: { hostShown }, completion: { result = $0 })
+        hostShown = false
+        backend.finish(0, .authorized)
+        XCTAssertFalse(sawUnlock)
+        XCTAssertFalse(controller.isUnlocked)
+        XCTAssertFalse(controller.isAuthenticating)
+        XCTAssertEqual(result, .cancelled)
+    }
+
+    @MainActor func testCompletionReportsCancellationAndFailureWithoutUnlocking() {
+        let backend = AccessTestAuthorizer()
+        let controller = AdvancedAccessController(authorizer: backend, observesSystemEvents: false)
+        var results: [AdminAuthorizationResult] = []
+        controller.requestUnlock(completion: { results.append($0) })
+        backend.finish(0, .cancelled)
+        controller.requestUnlock(completion: { results.append($0) })
+        backend.finish(1, .failed("未通过管理员验证"))
+        XCTAssertEqual(results, [.cancelled, .failed("未通过管理员验证")])
+        XCTAssertFalse(controller.isUnlocked)
+        XCTAssertEqual(controller.message, "未通过管理员验证")
+    }
+
+    @MainActor func testLockEventsAreSynchronousAndObserveLockedState() {
+        let backend = AccessTestAuthorizer()
+        let controller = AdvancedAccessController(authorizer: backend, observesSystemEvents: false)
+        var events = 0
+        var wasLocked = false
+        let subscription = controller.lockEvents.sink {
+            events += 1
+            wasLocked = !controller.isUnlocked && !controller.isAuthenticating
+        }
+        defer { subscription.cancel() }
+        controller.requestUnlock()
+        controller.lock()
+        XCTAssertEqual(events, 1)
+        XCTAssertTrue(wasLocked)
     }
 }
 

@@ -24,14 +24,19 @@ jobs:
           sh ./app/test-power.sh
           sh ./app/test-power-view.sh
 
-      - name: Check adaptive menu sizing
-        run: sh ./app/test-menu-sizing.sh
+      - name: Check menu sizing and authenticated navigation
+        run: |
+          sh ./app/test-menu-sizing.sh
+          sh ./app/test-menu-navigation.sh
 
       - name: Check battery reading boundaries
         run: sh ./app/test-battery-readings.sh
 
       - name: Check minimum display brightness and recovery
         run: sh ./app/test-brightness.sh
+
+      - name: Check display output restrictions and recovery
+        run: sh ./app/test-display-output.sh
 
       - name: Check daemon sleep and charge control
         run: sh ./tests/test-daemon.sh

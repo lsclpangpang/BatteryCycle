@@ -8,9 +8,13 @@ final class AdvancedAccessController: ObservableObject {
     @Published private(set) var isUnlocked = false
     @Published private(set) var isAuthenticating = false
     @Published private(set) var message: String?
+    /// Explicit revocation events, sent only after the gate is fully locked. Consumers must
+    /// not infer revocation from isAuthenticating's normal transition to false on success.
+    let lockEvents = PassthroughSubject<Void, Never>()
 
     private let authorizer: any AdminAuthorizing
     private var requestID: UUID?
+    private var authorizationGeneration = UUID()
     private var terminating = false
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
 
@@ -31,17 +35,27 @@ final class AdvancedAccessController: ObservableObject {
     }
 
     /// Called by a deliberate click on Advanced Features, never by hover or app launch.
-    func requestUnlock() {
-        guard !terminating, !isUnlocked, !isAuthenticating else { return }
+    @discardableResult
+    func requestUnlock(isSessionValid: @escaping @MainActor () -> Bool = { true },
+                       completion: AdminAuthorizationCompletion? = nil) -> Bool {
+        guard !terminating, !isUnlocked, !isAuthenticating else { return false }
+        guard isSessionValid() else { completion?(.cancelled); return false }
         let id = UUID()
         requestID = id
+        authorizationGeneration = id
         message = nil
         isAuthenticating = true
         authorizer.authorize { [weak self] result in
             guard let self, !self.terminating, self.requestID == id else { return }
             self.requestID = nil
             self.isAuthenticating = false
-            switch result {
+            // Publishing authentication's end may synchronously close the host. Check the
+            // owner again before publishing any unlocked state, never after showing settings.
+            guard !self.terminating, self.authorizationGeneration == id else { return }
+            let sessionValid = isSessionValid()
+            guard !self.terminating, self.authorizationGeneration == id else { return }
+            let effectiveResult: AdminAuthorizationResult = sessionValid ? result : .cancelled
+            switch effectiveResult {
             case .authorized:
                 self.isUnlocked = true
             case .cancelled:
@@ -50,17 +64,21 @@ final class AdvancedAccessController: ObservableObject {
                 self.isUnlocked = false
                 self.message = reason
             }
+            completion?(effectiveResult)
         }
+        return true
     }
 
-    /// The owner must call this when its advanced settings window actually closes.
-    /// Security Agent taking focus from the menu is not a new authorization session.
+    /// The owner must call this when the hosting panel actually closes or returns to main.
+    /// Security Agent taking focus while the controlled popover stays shown is not a close.
     func lock() {
         requestID = nil
+        authorizationGeneration = UUID()
         isUnlocked = false
         isAuthenticating = false
         message = nil
         authorizer.cancel()
+        lockEvents.send()
     }
 
     func prepareForTermination() {

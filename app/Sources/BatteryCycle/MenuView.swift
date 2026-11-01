@@ -4,8 +4,10 @@ struct MenuView: View {
     @EnvironmentObject var model: BatteryModel
     @EnvironmentObject var displays: DisplayController
     @EnvironmentObject var brightness: BrightnessController
-    @EnvironmentObject var advancedFeatures: AdvancedFeaturesWindow
+    @EnvironmentObject var access: AdvancedAccessController
+    @EnvironmentObject var navigation: MenuNavigationController
     @EnvironmentObject var restrictions: DisplayOutputRestrictionController
+    var onHeightChange: (CGFloat) -> Void = { _ in }
     @State private var powerExpanded = false
     @State private var isVisible = false
     @State private var sizing = MenuSizing()
@@ -23,37 +25,46 @@ struct MenuView: View {
                 })
         }
         .frame(width: 300, height: viewportHeight)
+        .id(navigation.page)
         .coordinateSpace(name: "menuViewport")
         .onPreferenceChange(PowerFlowFrame.self) { powerFrame = $0 }
         .onAppear {
-            isVisible = true
-            updateScreenHeight()
-            model.loadConfig()
-            model.refresh()
-            model.refreshPorts()
-            model.checkDaemonVersion()
-            displays.reload()
-            brightness.refreshKeyboardPermission()
+            if navigation.isPresented { menuDidShow() }
+            onHeightChange(viewportHeight)
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
-            if isVisible { updateScreenHeight(preferWindow: true) }
+        .onChange(of: viewportHeight) { onHeightChange($0) }
+        // Observe every presentation event even while the reused hosting view is hidden.
+        .onReceive(navigation.$isPresented) { presented in
+            if presented { menuDidShow() } else { menuDidHide() }
         }
-        .onDisappear {
-            isVisible = false
+        .onChange(of: navigation.page) { _ in
             powerExpanded = false
             powerFrame = .zero
             brightnessRestrictionMessage = nil
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
+            if isVisible { updateScreenHeight(preferWindow: true) }
+        }
+        .onDisappear { menuDidHide() }
     }
 
+    @ViewBuilder
     private var content: some View {
+        if navigation.page == .advanced && access.isUnlocked {
+            advancedContent
+        } else {
+            mainContent
+        }
+    }
+
+    private var mainContent: some View {
         VStack(alignment: .leading, spacing: 14) {
             Button {
                 powerFrame = .zero
                 powerExpanded.toggle()
                 model.refreshPorts()
             } label: {
-                header
+                header()
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -155,19 +166,31 @@ struct MenuView: View {
             }
 
             Button {
-                advancedFeatures.show()
+                navigation.openAdvanced()
             } label: {
                 HStack {
                     Label("高级功能", systemImage: "lock")
                     Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if access.isAuthenticating {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .disabled(access.isAuthenticating)
             .accessibilityHint("使用管理员密码解锁")
+
+            if let message = access.message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             SwitchRow(title: "到达上下限时通知", isOn: $model.notifyThresholds)
 
@@ -189,8 +212,64 @@ struct MenuView: View {
         .frame(width: 300)
     }
 
+    private var advancedContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            header(showDisclosure: false)
+            LevelBar(pct: model.pct ?? 0, low: model.low, high: model.high, tint: model.tint)
+            Divider()
+            ZStack {
+                Text("高级功能").font(.headline)
+                HStack {
+                    Button { navigation.back() } label: {
+                        Label("返回", systemImage: "chevron.left")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("返回并锁定高级功能")
+                    Spacer()
+                }
+            }
+            SwitchRow(title: "禁止 HDMI 显示输出", isOn: Binding(
+                get: { restrictions.settings.hdmi },
+                set: { restrictions.setRestricted(.hdmi, $0) }
+            ))
+            SwitchRow(title: "禁止 USB-C / 雷雳显示输出", isOn: Binding(
+                get: { restrictions.settings.usbC },
+                set: { restrictions.setRestricted(.usbC, $0) }
+            ))
+            if let message = restrictions.message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("重试") { restrictions.retry() }
+                    .font(.caption)
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+    }
+
+    private func menuDidShow() {
+        guard !isVisible else { return }
+        isVisible = true
+        updateScreenHeight()
+        model.loadConfig()
+        model.refresh()
+        model.refreshPorts()
+        model.checkDaemonVersion()
+        displays.reload()
+        brightness.refreshKeyboardPermission()
+    }
+
+    private func menuDidHide() {
+        isVisible = false
+        powerExpanded = false
+        powerFrame = .zero
+        brightnessRestrictionMessage = nil
+    }
+
     private var powerIsVisible: Bool {
-        PowerFlowAnimationVisibility.isVisible(menuVisible: isVisible, frame: powerFrame,
+        PowerFlowAnimationVisibility.isVisible(menuVisible: isVisible && navigation.page == .main, frame: powerFrame,
                                                viewportHeight: viewportHeight)
     }
 
@@ -203,7 +282,7 @@ struct MenuView: View {
         if let screen { sizing.updateScreenHeight(screen.visibleFrame.height) }
     }
 
-    private var header: some View {
+    private func header(showDisclosure: Bool = true) -> some View {
         HStack(spacing: 12) {
             Text(model.percentText)
                 .font(.system(size: 34, weight: .semibold, design: .rounded))
@@ -218,9 +297,11 @@ struct MenuView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
-            Image(systemName: powerExpanded ? "chevron.up" : "chevron.down")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.secondary)
+            if showDisclosure {
+                Image(systemName: powerExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
