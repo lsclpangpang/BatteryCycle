@@ -4,10 +4,13 @@ struct MenuView: View {
     @EnvironmentObject var model: BatteryModel
     @EnvironmentObject var displays: DisplayController
     @EnvironmentObject var brightness: BrightnessController
+    @EnvironmentObject var advancedFeatures: AdvancedFeaturesWindow
+    @EnvironmentObject var restrictions: DisplayOutputRestrictionController
     @State private var powerExpanded = false
     @State private var isVisible = false
     @State private var sizing = MenuSizing()
     @State private var powerFrame: CGRect = .zero
+    @State private var brightnessRestrictionMessage: String?
 
     var body: some View {
         ScrollView(.vertical) {
@@ -39,6 +42,7 @@ struct MenuView: View {
             isVisible = false
             powerExpanded = false
             powerFrame = .zero
+            brightnessRestrictionMessage = nil
         }
     }
 
@@ -103,7 +107,14 @@ struct MenuView: View {
             VStack(alignment: .leading, spacing: 6) {
                 SwitchRow(title: "屏幕亮度降到最低", isOn: Binding(
                     get: { brightness.isEnabled },
-                    set: { brightness.setEnabled($0) }
+                    set: { enabled in
+                        guard !enabled || restrictions.permitsMinimumBrightness() else {
+                            brightnessRestrictionMessage = "当前屏幕设置下无法开启最低亮度模式"
+                            return
+                        }
+                        brightnessRestrictionMessage = nil
+                        brightness.setEnabled(enabled)
+                    }
                 ))
                 .disabled(brightness.needsRecovery)
                 Text(brightness.isEnabled
@@ -126,6 +137,12 @@ struct MenuView: View {
                         .foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if let message = brightnessRestrictionMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if brightness.needsRecovery {
                     Button("重试恢复屏幕设置") { brightness.recover() }
                         .font(.caption)
@@ -136,6 +153,21 @@ struct MenuView: View {
             if displays.manageDisplays {
                 ExternalDisplayList()
             }
+
+            Button {
+                advancedFeatures.show()
+            } label: {
+                HStack {
+                    Label("高级功能", systemImage: "lock")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("使用管理员密码解锁")
 
             SwitchRow(title: "到达上下限时通知", isOn: $model.notifyThresholds)
 
