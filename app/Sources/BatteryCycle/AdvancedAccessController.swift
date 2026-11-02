@@ -22,7 +22,7 @@ final class AdvancedAccessController: ObservableObject {
          workspaceNotifications: NotificationCenter? = nil,
          applicationNotifications: NotificationCenter = .default,
          distributedNotifications: NotificationCenter? = nil) {
-        self.authorizer = authorizer ?? AdminAuthorization()
+        self.authorizer = authorizer ?? TouchIDAdminAuthorization()
         guard observesSystemEvents else { return }
         let workspace = workspaceNotifications ?? NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification,
