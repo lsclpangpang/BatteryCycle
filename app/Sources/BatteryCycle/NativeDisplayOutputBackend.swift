@@ -39,12 +39,22 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
         let framebuffers = Self.framebuffers()
         let ids = try Self.onlineDisplays()
         let information = Dictionary(uniqueKeysWithValues: ids.map { ($0, Self.info($0)) })
-        let identities = Dictionary(uniqueKeysWithValues: ids.map { id in
-            (id, DisplayTransportIdentity(
+        let identities = Dictionary(uniqueKeysWithValues: ids.map { id -> (UInt32, DisplayTransportIdentity) in
+            let identity = DisplayTransportIdentity(
                 registryPath: information[id]?["IODisplayLocation"] as? String,
                 edid: information[id]?["IODisplayEDID"] as? Data,
                 vendor: CGDisplayVendorNumber(id), product: CGDisplayModelNumber(id),
-                serial: CGDisplaySerialNumber(id)))
+                serial: CGDisplaySerialNumber(id))
+            // Apple Silicon may expose only an EDID UUID on the framebuffer, rather
+            // than the full EDID in CoreDisplay. Borrow it only from the exact CG
+            // registry path with a compatible identity, never from a model-only match.
+            guard CGDisplayIsBuiltin(id) == 0,
+                  let path = identity.registryPath,
+                  let matched = DisplayTransportMatcher.match(identity, candidates: framebuffers.map(\.identity)),
+                  framebuffers[matched].identity.registryPath == path else { return (id, identity) }
+            return (id, DisplayTransportIdentity(registryPath: path, edid: identity.edid,
+                vendor: identity.vendor, product: identity.product, serial: identity.serial,
+                edidUUID: framebuffers[matched].identity.edidUUID))
         })
         let linksAfter = Self.displayPortLinks()
         let after = physicalInventory()
@@ -300,7 +310,8 @@ final class NativeDisplayOutputBackend: DisplayOutputBackend {
                 let transport = properties["Transport"] as? [String: Any]
                 result.append(.init(identity: .init(registryPath: registryPath(service),
                     edid: properties["IODisplayEDID"] as? Data, vendor: vendor, product: model,
-                    serial: (product["SerialNumber"] as? NSNumber)?.uint32Value ?? 0),
+                    serial: (product["SerialNumber"] as? NSNumber)?.uint32Value ?? 0,
+                    edidUUID: (properties["EDID UUID"] as? String).flatMap(UUID.init(uuidString:))),
                     ancestorPorts: ancestorPorts(service), upstream: transport?["Upstream"] as? String,
                     downstream: transport?["Downstream"] as? String))
             }

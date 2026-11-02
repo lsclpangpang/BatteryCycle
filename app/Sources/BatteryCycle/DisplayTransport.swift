@@ -59,6 +59,17 @@ struct DisplayTransportIdentity: Equatable {
     let vendor: UInt32
     let product: UInt32
     let serial: UInt32
+    let edidUUID: UUID?
+
+    init(registryPath: String?, edid: Data?, vendor: UInt32, product: UInt32, serial: UInt32,
+         edidUUID: UUID? = nil) {
+        self.registryPath = registryPath
+        self.edid = edid
+        self.vendor = vendor
+        self.product = product
+        self.serial = serial
+        self.edidUUID = edidUUID
+    }
 }
 
 enum DisplayTransportMatcher {
@@ -101,6 +112,15 @@ enum DisplayTransportMatcher {
         }
         return true
     }
+
+    /// Some Apple framebuffers expose these EDID identity bytes as an EDID UUID.
+    /// This is a partial fingerprint, not proof that the complete EDIDs agree.
+    static func edidUUID(_ data: Data) -> UUID? {
+        guard validEDID(data) else { return nil }
+        let bytes = Array(data)
+        return UUID(uuid: (bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+                           bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23]))
+    }
 }
 
 enum DisplayOutputPresence {
@@ -120,10 +140,15 @@ struct DisplayPortLinkEvidence: Equatable {
     let vendor: UInt32?
     let product: UInt32?
     let serial: UInt32?
+    let edid: Data?
 
     init(properties: [String: Any]) {
         active = Self.boolean(properties["Active"])
         let metadata = properties["Metadata"] as? [String: Any] ?? [:]
+        let topEDID = properties["EDID"] as? Data
+        let metadataEDID = metadata["EDID"] as? Data
+        edid = topEDID ?? metadataEDID
+        let conflictingEDID = topEDID != nil && metadataEDID != nil && topEDID != metadataEDID
         let manufacturer = properties["ManufacturerName"] as? String ?? metadata["ManufacturerName"] as? String
         vendor = manufacturer.flatMap(Self.packedManufacturer)
         product = Self.number(properties["ProductID"] ?? metadata["ProductID"])
@@ -131,7 +156,7 @@ struct DisplayPortLinkEvidence: Equatable {
         let parentType = properties["ParentBuiltInPortTypeDescription"] as? String
         let directType = properties["ParentPortTypeDescription"] as? String
         let number = Self.number(properties["ParentBuiltInPortNumber"])
-        if Self.boolean(properties["ParentPortBuiltIn"]) == true,
+        if !conflictingEDID, Self.boolean(properties["ParentPortBuiltIn"]) == true,
            let type = parentType, directType == nil || directType == type,
            let number, (1...255).contains(number),
            let description = properties["TransportDescription"] as? String,
@@ -173,16 +198,72 @@ struct DisplayPortLinkEvidence: Equatable {
 enum DisplayPortLinkMatcher {
     static func port(for display: DisplayTransportIdentity, among displays: [DisplayTransportIdentity],
                      links: [DisplayPortLinkEvidence]) -> DisplayOutputPort? {
-        guard display.serial != 0, display.vendor != 0, display.product != 0 else { return nil }
+        guard display.vendor != 0, display.product != 0 else { return nil }
+        let activeLinks = links.filter {
+            $0.active == true && $0.port != nil && $0.vendor == display.vendor && $0.product == display.product
+        }
+        // An opaque framebuffer UUID alone cannot prove that a same-model
+        // peer has a different EDID. Keep that peer ambiguous on both paths.
+        let unidentifiedDisplay = displays.contains {
+            $0 != display && $0.vendor == display.vendor && $0.product == display.product
+                && $0.edid.flatMap(DisplayTransportMatcher.edidUUID) == nil
+                && !(display.serial != 0 && $0.serial != 0 && display.serial != $0.serial)
+        }
+        let unidentifiedLink = links.contains {
+            $0.active == true && $0.port != nil && $0.vendor == display.vendor && $0.product == display.product
+                && $0.edid.flatMap(DisplayTransportMatcher.edidUUID) == nil
+                && !(display.serial != 0 && ($0.serial ?? 0) != 0 && display.serial != $0.serial)
+        }
+        if let edid = display.edid, DisplayTransportMatcher.validEDID(edid) {
+            let sameEDID = displays.filter {
+                $0.vendor == display.vendor && $0.product == display.product && $0.edid == edid
+            }
+            // Identical EDIDs on multiple displays/links remain ambiguous even
+            // if a reported serial differs. A serial must not break this tie.
+            guard sameEDID.count == 1 else { return nil }
+            let candidates = activeLinks.filter { $0.edid == edid }
+            if !candidates.isEmpty {
+                guard candidates.count == 1, !unidentifiedDisplay, !unidentifiedLink else { return nil }
+                let candidate = candidates[0]
+                if display.serial != 0, let serial = candidate.serial,
+                   serial != 0, serial != display.serial { return nil }
+                return candidate.port
+            }
+        }
+        if let fingerprint = display.edidUUID {
+            // Only a positive match supports this Apple framebuffer identity
+            // format. Other devices expose opaque UUIDs, so a miss is not a
+            // contradiction of the existing nonzero-serial evidence.
+            let candidates = links.filter {
+                $0.active == true && $0.port != nil && $0.edid.flatMap(DisplayTransportMatcher.edidUUID) == fingerprint
+            }
+            if !candidates.isEmpty {
+                let sameFingerprint = displays.filter {
+                    $0.edidUUID == fingerprint || $0.edid.flatMap(DisplayTransportMatcher.edidUUID) == fingerprint
+                }
+                guard candidates.count == 1, sameFingerprint.count == 1, sameFingerprint[0] == display else { return nil }
+                let candidate = candidates[0]
+                guard candidate.vendor == display.vendor, candidate.product == display.product else { return nil }
+                if display.serial != 0, let serial = candidate.serial,
+                   serial != 0, serial != display.serial { return nil }
+                if let edid = display.edid, DisplayTransportMatcher.validEDID(edid), edid != candidate.edid { return nil }
+                guard !unidentifiedDisplay, !unidentifiedLink else { return nil }
+                return candidate.port
+            }
+        }
+        // Older transports without a complete EDID still support a unique,
+        // nonzero serial, but never override contradictory valid EDIDs.
+        guard display.serial != 0 else { return nil }
         let sameDisplay = displays.filter {
             $0.vendor == display.vendor && $0.product == display.product && $0.serial == display.serial
         }
         guard sameDisplay.count == 1 else { return nil }
-        let candidates = links.filter {
-            $0.active == true && $0.port != nil && $0.vendor == display.vendor
-                && $0.product == display.product && $0.serial == display.serial
-        }
+        let candidates = activeLinks.filter { $0.serial == display.serial }
         guard candidates.count == 1 else { return nil }
-        return candidates[0].port
+        let candidate = candidates[0]
+        if let displayEDID = display.edid, let linkEDID = candidate.edid,
+           DisplayTransportMatcher.validEDID(displayEDID), DisplayTransportMatcher.validEDID(linkEDID),
+           displayEDID != linkEDID { return nil }
+        return candidate.port
     }
 }
