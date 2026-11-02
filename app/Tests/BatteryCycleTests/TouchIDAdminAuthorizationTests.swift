@@ -21,7 +21,8 @@ private func XCTAssertNil<T>(_ value: T?) { if value != nil { touchIDFailures +=
         tests.testBiometricCancellationDoesNotOpenPassword()
         tests.testBiometricFailureDoesNotAuthorizeOrOpenPassword()
         tests.testIdentityChangeAfterTouchIDFailsClosed()
-        tests.testDuplicateRequestsDoNotStartAnotherAuthentication()
+        tests.testNewRequestCancelsPreviousRequest()
+        tests.testRequestStartedByCancelledCallerIsNotOverwritten()
         tests.testCancelDuringIdentityLookupIgnoresLateResult()
         tests.testCancelDuringTouchIDIgnoresLateSuccess()
         tests.testCancelDuringIdentityRecheckCannotAuthorize()
@@ -35,7 +36,7 @@ private func XCTAssertNil<T>(_ value: T?) { if value != nil { touchIDFailures +=
         tests.testNativeUnavailableFallbackAndFailedMatchErrorsRequestPassword()
         tests.testUnknownErrorsFailClosed()
         tests.testFailedPreflightNeverShowsTouchIDPrompt()
-        print("TouchIDAdminAuthorization: 21 checks, \(touchIDFailures) failures")
+        print("TouchIDAdminAuthorization: 22 checks, \(touchIDFailures) failures")
         if touchIDFailures > 0 { exit(1) }
     }
 }
@@ -130,16 +131,35 @@ final class TouchIDAdminAuthorizationTests: XCTestCase {
         }
     }
 
-    @MainActor func testDuplicateRequestsDoNotStartAnotherAuthentication() {
+    @MainActor func testNewRequestCancelsPreviousRequest() {
         let fixture = TouchIDFixture()
         fixture.start()
         fixture.start()
-        XCTAssertEqual(fixture.identity.requests, 1)
+        XCTAssertEqual(fixture.results, [.cancelled])
+        XCTAssertEqual(fixture.identity.requests, 2)
         fixture.identity.finish(0, identity())
+        XCTAssertEqual(fixture.biometric.requests, 0)
+        fixture.identity.finish(1, identity())
         XCTAssertEqual(fixture.biometric.requests, 1)
         fixture.biometric.finish(0, .authorized)
+        fixture.identity.finish(2, identity())
+        XCTAssertEqual(fixture.results, [.cancelled, .authorized])
+    }
+
+    @MainActor func testRequestStartedByCancelledCallerIsNotOverwritten() {
+        let fixture = TouchIDFixture()
+        fixture.authorizer.authorize { result in
+            fixture.results.append(result)
+            if fixture.results.count == 1 { fixture.start() }
+        }
+        fixture.start()
+        // The first caller's restart replaced the second request, which is also cancelled.
+        XCTAssertEqual(fixture.results, [.cancelled, .cancelled])
+        XCTAssertEqual(fixture.identity.requests, 2)
         fixture.identity.finish(1, identity())
-        XCTAssertEqual(fixture.results, [.authorized])
+        fixture.biometric.finish(0, .authorized)
+        fixture.identity.finish(2, identity())
+        XCTAssertEqual(fixture.results, [.cancelled, .cancelled, .authorized])
     }
 
     @MainActor func testCancelDuringIdentityLookupIgnoresLateResult() {

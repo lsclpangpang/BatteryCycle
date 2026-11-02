@@ -86,9 +86,12 @@ enum TouchIDAuthenticationPolicy {
     }
 
     func authorize(completion: @escaping AdminAuthorizationCompletion) {
-        guard attempt == nil else { return }
+        // Match AdminAuthorization: a new request replaces the old one, whose caller is told
+        // it was cancelled, so no completion is ever silently dropped.
         let id = UUID()
-        attempt = Attempt(id: id, phase: .initialIdentity, completion: completion)
+        replaceAttempt(with: Attempt(id: id, phase: .initialIdentity, completion: completion))
+        // The old caller may have started yet another request, which replaced this one.
+        guard attempt?.id == id else { return }
         identityChecker.check { [weak self] identity in
             guard let self, self.isCurrent(id, phase: .initialIdentity) else { return }
             guard let uid = identity?.eligibleUID else { self.requestPassword(id); return }
@@ -97,11 +100,15 @@ enum TouchIDAuthenticationPolicy {
         }
     }
 
-    func cancel() {
+    func cancel() { replaceAttempt(with: nil) }
+
+    private func replaceAttempt(with next: Attempt?) {
         let previous = attempt
         // Invalidate ownership before invalidating LAContext or AuthorizationRef, since their
         // cancellation replies may arrive synchronously or after a new request has started.
-        attempt = nil
+        // Install the next request before telling the old caller, so a request it starts from
+        // its completion goes through this same path instead of being overwritten afterwards.
+        attempt = next
         guard let previous else { return }
         touchID.cancel()
         password.cancel()
@@ -167,40 +174,51 @@ enum TouchIDAuthenticationPolicy {
     nonisolated private static func readIdentity() -> AdministratorIdentity? {
         let realUID = getuid(), effectiveUID = geteuid(), console = consoleUID()
         guard realUID != 0, realUID == effectiveUID, console == realUID else { return nil }
-        let administrator = isAdministrator(uid: realUID)
+        let administrator = DirectoryMembership.isAdministrator(uid: realUID)
         // Do not return a stale mixed snapshot if a console or process identity changed
         // while Directory Services was answering the membership request.
         guard getuid() == realUID, geteuid() == effectiveUID, consoleUID() == console else { return nil }
         return .init(realUID: realUID, effectiveUID: effectiveUID, consoleUID: console,
                      isAdministrator: administrator)
     }
+}
 
-    nonisolated private static func isAdministrator(uid: uid_t) -> Bool? {
-        // membership.h is public but is not exported by the Swift Darwin module. Resolve
-        // its public libSystem symbols using their exact C declarations from that header.
-        typealias UIDToUUID = @convention(c) (uid_t, UnsafeMutablePointer<UInt8>) -> Int32
-        typealias IdentifierToUUID = @convention(c) (Int32, UnsafeRawPointer, size_t, UnsafeMutablePointer<UInt8>) -> Int32
-        typealias CheckMembership = @convention(c) (UnsafePointer<UInt8>, UnsafePointer<UInt8>, UnsafeMutablePointer<Int32>) -> Int32
-        guard let handle = dlopen(nil, RTLD_LAZY) else { return nil }
-        defer { dlclose(handle) }
-        guard let uidSymbol = dlsym(handle, "mbr_uid_to_uuid"),
-              let groupSymbol = dlsym(handle, "mbr_identifier_to_uuid"),
+/// membership.h is public but is not exported by the Swift Darwin module. Resolve its public
+/// libSystem symbols once, using their exact C declarations from that header.
+private enum DirectoryMembership {
+    private typealias UIDToUUID = @convention(c) (uid_t, UnsafeMutablePointer<UInt8>) -> Int32
+    private typealias GIDToUUID = @convention(c) (gid_t, UnsafeMutablePointer<UInt8>) -> Int32
+    private typealias CheckMembership = @convention(c) (UnsafePointer<UInt8>, UnsafePointer<UInt8>, UnsafeMutablePointer<Int32>) -> Int32
+    private struct Functions {
+        let uidToUUID: UIDToUUID
+        let gidToUUID: GIDToUUID
+        let checkMembership: CheckMembership
+    }
+
+    /// macOS reserves gid 80 for the admin group.
+    private static let adminGID: gid_t = 80
+
+    /// The handle is never closed; libSystem stays loaded for the life of the process.
+    private static let functions: Functions? = {
+        guard let handle = dlopen(nil, RTLD_LAZY),
+              let uidSymbol = dlsym(handle, "mbr_uid_to_uuid"),
+              let gidSymbol = dlsym(handle, "mbr_gid_to_uuid"),
               let checkSymbol = dlsym(handle, "mbr_check_membership") else { return nil }
-        let uidToUUID = unsafeBitCast(uidSymbol, to: UIDToUUID.self)
-        let identifierToUUID = unsafeBitCast(groupSymbol, to: IdentifierToUUID.self)
-        let checkMembership = unsafeBitCast(checkSymbol, to: CheckMembership.self)
+        return Functions(uidToUUID: unsafeBitCast(uidSymbol, to: UIDToUUID.self),
+                         gidToUUID: unsafeBitCast(gidSymbol, to: GIDToUUID.self),
+                         checkMembership: unsafeBitCast(checkSymbol, to: CheckMembership.self))
+    }()
+
+    static func isAdministrator(uid: uid_t) -> Bool? {
+        guard let functions = Self.functions else { return nil }
         var user = [UInt8](repeating: 0, count: 16)
         var group = [UInt8](repeating: 0, count: 16)
-        let userStatus = user.withUnsafeMutableBufferPointer { uidToUUID(uid, $0.baseAddress!) }
-        // ID_TYPE_GROUPNAME = 5; membership.h requires a NUL-terminated UTF-8 name.
-        let groupName = Array("admin".utf8CString)
-        let groupStatus = groupName.withUnsafeBufferPointer { name in
-            group.withUnsafeMutableBufferPointer { identifierToUUID(5, name.baseAddress!, size_t(name.count), $0.baseAddress!) }
-        }
+        let userStatus = user.withUnsafeMutableBufferPointer { functions.uidToUUID(uid, $0.baseAddress!) }
+        let groupStatus = group.withUnsafeMutableBufferPointer { functions.gidToUUID(adminGID, $0.baseAddress!) }
         guard userStatus == 0, groupStatus == 0 else { return nil }
         var member: Int32 = 0
         let status = user.withUnsafeBufferPointer { user in
-            group.withUnsafeBufferPointer { group in checkMembership(user.baseAddress!, group.baseAddress!, &member) }
+            group.withUnsafeBufferPointer { group in functions.checkMembership(user.baseAddress!, group.baseAddress!, &member) }
         }
         guard status == 0, member == 0 || member == 1 else { return nil }
         return member == 1
@@ -216,14 +234,14 @@ enum TouchIDAuthenticationPolicy {
     private var attempt: Attempt?
 
     func authenticate(completion: @escaping TouchIDAuthenticationCompletion) {
-        guard attempt == nil else { return }
         // Never reuse a successfully evaluated context or a recent device-unlock grant.
         let context = LAContext()
         context.touchIDAuthenticationAllowableReuseDuration = TouchIDAuthenticationPolicy.reuseDuration
         context.localizedFallbackTitle = TouchIDAuthenticationPolicy.fallbackTitle
         context.localizedCancelTitle = "取消"
         let id = UUID()
-        attempt = Attempt(id: id, context: context, completion: completion)
+        replaceAttempt(with: Attempt(id: id, context: context, completion: completion))
+        guard attempt?.id == id else { return }
         // biometryType is set only by canEvaluatePolicy, so evaluate that first.
         let canEvaluate = context.canEvaluatePolicy(TouchIDAuthenticationPolicy.policy, error: nil)
         guard TouchIDAuthenticationPolicy.canPrompt(canEvaluate: canEvaluate, biometryType: context.biometryType) else {
@@ -236,9 +254,12 @@ enum TouchIDAuthenticationPolicy {
         }
     }
 
-    func cancel() {
-        guard let previous = attempt else { return }
-        attempt = nil
+    func cancel() { replaceAttempt(with: nil) }
+
+    private func replaceAttempt(with next: Attempt?) {
+        let previous = attempt
+        attempt = next
+        guard let previous else { return }
         previous.context.invalidate()
         previous.completion(.cancelled)
     }
