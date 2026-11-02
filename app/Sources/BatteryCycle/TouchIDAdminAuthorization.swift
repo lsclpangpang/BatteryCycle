@@ -39,6 +39,11 @@ enum TouchIDAuthenticationPolicy {
     static let reuseDuration: TimeInterval = 0
     static let fallbackTitle = "使用管理员密码"
 
+    /// No prompt has been shown when preflight fails, so every reason means "use the password".
+    static func canPrompt(canEvaluate: Bool, biometryType: LABiometryType) -> Bool {
+        canEvaluate && biometryType == .touchID
+    }
+
     static func result(success: Bool, error: NSError?) -> TouchIDAuthenticationResult {
         if success && error == nil { return .authorized }
         guard let error, error.domain == LAError.errorDomain, let code = LAError.Code(rawValue: error.code) else {
@@ -46,7 +51,9 @@ enum TouchIDAuthenticationPolicy {
         }
         switch code {
         case .userCancel, .systemCancel, .appCancel, .invalidContext: return .cancelled
-        case .userFallback: return .usePassword
+        // Repeated non-matching fingers end LocalAuthentication's prompt. The password path still
+        // requires an administrator, so offer it instead of making the user start over.
+        case .userFallback, .authenticationFailed: return .usePassword
         case .biometryNotAvailable, .biometryNotEnrolled, .biometryLockout,
              .biometryDisconnected, .biometryNotPaired: return .unavailable
         default: return .failed("Touch ID 验证未通过，请重试")
@@ -217,13 +224,12 @@ enum TouchIDAuthenticationPolicy {
         context.localizedCancelTitle = "取消"
         let id = UUID()
         attempt = Attempt(id: id, context: context, completion: completion)
-        var error: NSError?
-        guard context.canEvaluatePolicy(TouchIDAuthenticationPolicy.policy, error: &error) else {
-            let result = error.map { TouchIDAuthenticationPolicy.result(success: false, error: $0) } ?? .unavailable
-            finish(id, result)
+        // biometryType is set only by canEvaluatePolicy, so evaluate that first.
+        let canEvaluate = context.canEvaluatePolicy(TouchIDAuthenticationPolicy.policy, error: nil)
+        guard TouchIDAuthenticationPolicy.canPrompt(canEvaluate: canEvaluate, biometryType: context.biometryType) else {
+            finish(id, .unavailable)
             return
         }
-        guard context.biometryType == .touchID else { finish(id, .unavailable); return }
         context.evaluatePolicy(TouchIDAuthenticationPolicy.policy, localizedReason: "解锁高级功能") { [weak self] success, error in
             let result = TouchIDAuthenticationPolicy.result(success: success, error: error as NSError?)
             Task { @MainActor in self?.finish(id, result) }

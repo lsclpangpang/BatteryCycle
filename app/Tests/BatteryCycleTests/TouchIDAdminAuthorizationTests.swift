@@ -32,9 +32,10 @@ private func XCTAssertNil<T>(_ value: T?) { if value != nil { touchIDFailures +=
         tests.testEachNewRequestChecksIdentityAgain()
         tests.testNativePolicyUsesOnlyBiometricsAndDisablesReuse()
         tests.testNativeCancellationErrorsNeverRequestPassword()
-        tests.testNativeUnavailableAndUserFallbackErrorsRequestPassword()
-        tests.testUnknownAndAuthenticationFailedErrorsFailClosed()
-        print("TouchIDAdminAuthorization: 20 checks, \(touchIDFailures) failures")
+        tests.testNativeUnavailableFallbackAndFailedMatchErrorsRequestPassword()
+        tests.testUnknownErrorsFailClosed()
+        tests.testFailedPreflightNeverShowsTouchIDPrompt()
+        print("TouchIDAdminAuthorization: 21 checks, \(touchIDFailures) failures")
         if touchIDFailures > 0 { exit(1) }
     }
 }
@@ -110,8 +111,8 @@ final class TouchIDAdminAuthorizationTests: XCTestCase {
         let fixture = TouchIDFixture()
         fixture.start()
         fixture.identity.finish(0, identity())
-        fixture.biometric.finish(0, .failed("指纹未通过"))
-        XCTAssertEqual(fixture.results, [.failed("指纹未通过")])
+        fixture.biometric.finish(0, .failed("Touch ID 验证未通过"))
+        XCTAssertEqual(fixture.results, [.failed("Touch ID 验证未通过")])
         XCTAssertEqual(fixture.password.requests, 0)
     }
 
@@ -246,22 +247,30 @@ final class TouchIDAdminAuthorizationTests: XCTestCase {
         }
     }
 
-    func testNativeUnavailableAndUserFallbackErrorsRequestPassword() {
+    func testNativeUnavailableFallbackAndFailedMatchErrorsRequestPassword() {
         for code: LAError.Code in [.biometryNotAvailable, .biometryNotEnrolled, .biometryLockout,
                                   .biometryDisconnected, .biometryNotPaired] {
             XCTAssertEqual(TouchIDAuthenticationPolicy.result(success: false,
                 error: NSError(domain: LAError.errorDomain, code: code.rawValue)), .unavailable)
         }
-        XCTAssertEqual(TouchIDAuthenticationPolicy.result(success: false,
-            error: NSError(domain: LAError.errorDomain, code: LAError.userFallback.rawValue)), .usePassword)
+        for code: LAError.Code in [.userFallback, .authenticationFailed] {
+            XCTAssertEqual(TouchIDAuthenticationPolicy.result(success: false,
+                error: NSError(domain: LAError.errorDomain, code: code.rawValue)), .usePassword)
+        }
     }
 
-    func testUnknownAndAuthenticationFailedErrorsFailClosed() {
+    func testUnknownErrorsFailClosed() {
         for error in [nil, NSError(domain: "OtherError", code: LAError.userFallback.rawValue),
-                      NSError(domain: LAError.errorDomain, code: LAError.authenticationFailed.rawValue)] {
+                      NSError(domain: LAError.errorDomain, code: LAError.notInteractive.rawValue)] {
             let outcome = TouchIDAuthenticationPolicy.result(success: false, error: error)
             if case .failed = outcome { } else { XCTAssertTrue(false) }
         }
+    }
+
+    func testFailedPreflightNeverShowsTouchIDPrompt() {
+        XCTAssertTrue(TouchIDAuthenticationPolicy.canPrompt(canEvaluate: true, biometryType: .touchID))
+        XCTAssertTrue(!TouchIDAuthenticationPolicy.canPrompt(canEvaluate: false, biometryType: .touchID))
+        XCTAssertTrue(!TouchIDAuthenticationPolicy.canPrompt(canEvaluate: true, biometryType: .none))
     }
 }
 
