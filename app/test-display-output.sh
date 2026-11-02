@@ -21,9 +21,14 @@ xcrun swiftc -parse-as-library -D DISPLAY_RECOVERY_STANDALONE \
     Tests/BatteryCycleTests/DisplayRecoveryResolverTests.swift -o "$OUT/recovery-resolver-checks"
 "$OUT/recovery-resolver-checks"
 xcrun swiftc -parse-as-library -D ADVANCED_ACCESS_STANDALONE \
-    Sources/BatteryCycle/AdminAuthorization.swift Sources/BatteryCycle/AdvancedAccessController.swift \
+    Sources/BatteryCycle/AdminAuthorization.swift Sources/BatteryCycle/TouchIDAdminAuthorization.swift \
+    Sources/BatteryCycle/AdvancedAccessController.swift \
     Tests/BatteryCycleTests/AdvancedAccessTests.swift -o "$OUT/access-checks"
 "$OUT/access-checks"
+xcrun swiftc -parse-as-library -D TOUCH_ID_ADMIN_STANDALONE \
+    Sources/BatteryCycle/AdminAuthorization.swift Sources/BatteryCycle/TouchIDAdminAuthorization.swift \
+    Tests/BatteryCycleTests/TouchIDAdminAuthorizationTests.swift -o "$OUT/touch-id-checks"
+"$OUT/touch-id-checks"
 xcrun swiftc -parse-as-library -D DISPLAY_RESTRICTION_CONTROLLER_STANDALONE \
     Sources/BatteryCycle/DisplayOutputBackend.swift Sources/BatteryCycle/DisplayTransport.swift \
     Sources/BatteryCycle/DisplayRecoveryResolver.swift Sources/BatteryCycle/NativeDisplayOutputBackend.swift \

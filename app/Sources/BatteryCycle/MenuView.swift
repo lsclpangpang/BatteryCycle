@@ -183,7 +183,7 @@ struct MenuView: View {
             }
             .buttonStyle(.plain)
             .disabled(access.isAuthenticating)
-            .accessibilityHint("使用管理员密码解锁")
+            .accessibilityHint("使用 Touch ID 或管理员密码解锁")
 
             if let message = access.message {
                 Text(message)

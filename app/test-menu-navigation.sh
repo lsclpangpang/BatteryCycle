@@ -5,7 +5,8 @@ cd "$(dirname "$0")"
 OUT=.build/menu-checks
 mkdir -p "$OUT"
 xcrun swiftc -parse-as-library -D MENU_NAVIGATION_STANDALONE \
-    Sources/BatteryCycle/AdminAuthorization.swift Sources/BatteryCycle/AdvancedAccessController.swift \
+    Sources/BatteryCycle/AdminAuthorization.swift Sources/BatteryCycle/TouchIDAdminAuthorization.swift \
+    Sources/BatteryCycle/AdvancedAccessController.swift \
     Sources/BatteryCycle/MenuNavigationController.swift \
     Tests/BatteryCycleTests/MenuNavigationTests.swift -o "$OUT/navigation-checks"
 "$OUT/navigation-checks"
