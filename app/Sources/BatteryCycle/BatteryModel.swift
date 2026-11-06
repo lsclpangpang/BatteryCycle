@@ -735,7 +735,7 @@ final class BatteryModel: ObservableObject {
         switch phase {
         case .offline: return daemonInstalled ? "后台服务未运行" : "需要安装后台服务"
         case .fault: return "无法控制充电"
-        case .paused: return "已暂停"
+        case .paused: return "系统管理"
         // 插上电源后充电器要过几秒才开始充电（温度高时也可能暂停），按系统报告的实际状态显示，和菜单栏图标一致
         case .charge: return !onAC ? "等待接通电源" : pluggedNotCharging ? "已接通电源，暂未充电" : "充电中"
         case .discharge: return "放电中"
@@ -750,10 +750,10 @@ final class BatteryModel: ObservableObject {
             if !daemonInstalled { return "首次使用，点击下方按钮安装，需要输入一次管理员密码" }
             return statusProblem ?? "后台服务没有响应"
         case .fault: return "\(status?.fault ?? "")，已尝试恢复系统默认充电，详情见 /var/log/batteryd.log"
-        case .paused: return "按系统默认方式充电"
+        case .paused: return "充放电由 macOS 管理"
         case .charge: return "充到 \(high)% 后停止充电"
         case .discharge: return "插着电也用电池，降到 \(low)% 后开始充电"
-        case .full: return "充到 100% 后自动恢复循环"
+        case .full: return enabled ? "充到 100% 后自动恢复循环" : "充到 100% 后交由系统管理"
         }
     }
 
@@ -762,7 +762,7 @@ final class BatteryModel: ObservableObject {
         switch phase {
         case .offline: return daemonInstalled ? "exclamationmark.triangle.fill" : "arrow.down.app.fill"
         case .fault: return "exclamationmark.octagon.fill"
-        case .paused: return "pause.circle.fill"
+        case .paused: return "gearshape.fill"
         case .charge: return "bolt.fill"
         case .discharge: return "arrow.down.circle.fill"
         case .full: return "bolt.circle.fill"
@@ -774,7 +774,7 @@ final class BatteryModel: ObservableObject {
         switch phase {
         case .offline: return daemonInstalled ? .red : .accentColor
         case .fault: return .red
-        case .paused: return .secondary
+        case .paused: return .blue
         case .charge: return .green
         case .discharge: return .orange
         case .full: return .blue
