@@ -70,8 +70,8 @@ struct MenuView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("\(model.percentText)，\(model.title)，电力流向")
             .accessibilityValue(powerExpanded ? "已展开" : "已收起")
-            .help("点击展开或收起电力流向")
-            LevelBar(pct: model.pct ?? 0, low: model.low, high: model.high, tint: model.tint)
+            .accessibilityHint("点击展开或收起电力流向")
+            levelBar
             if powerExpanded {
                 PowerFlowView(telemetry: model.power, ports: model.ports, animationsEnabled: powerIsVisible)
                     .background(GeometryReader { geometry in
@@ -215,7 +215,7 @@ struct MenuView: View {
     private var advancedContent: some View {
         VStack(alignment: .leading, spacing: 14) {
             header(showDisclosure: false)
-            LevelBar(pct: model.pct ?? 0, low: model.low, high: model.high, tint: model.tint)
+            levelBar
             Divider()
             ZStack {
                 Text("高级功能").font(.headline)
@@ -283,26 +283,20 @@ struct MenuView: View {
     }
 
     private func header(showDisclosure: Bool = true) -> some View {
-        HStack(spacing: 12) {
-            Text(model.percentText)
-                .font(.system(size: 34, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-            VStack(alignment: .leading, spacing: 2) {
-                Label(model.title, systemImage: model.phaseSymbol)
-                    .font(.headline)
-                    .foregroundStyle(model.tint)
-                Text(model.subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 0)
-            if showDisclosure {
-                Image(systemName: powerExpanded ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
-        }
+        BatteryStatusHeader(
+            pct: model.pct,
+            title: model.title,
+            subtitle: model.subtitle,
+            symbol: model.phaseSymbol,
+            tint: model.tint,
+            showDisclosure: showDisclosure,
+            expanded: powerExpanded
+        )
+    }
+
+    private var levelBar: some View {
+        LevelBar(pct: model.pct, low: model.low, high: model.high,
+                 tint: model.tint, showsCycleRange: model.enabled)
     }
 
     private var footer: some View {
@@ -362,47 +356,6 @@ private struct PowerFlowFrame: PreferenceKey {
     static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
         let next = nextValue()
         if PowerFlowAnimationVisibility.hasMeasurement(next) { value = next }
-    }
-}
-
-/// 电量条：浅色区域是循环区间，竖线标出上下限
-struct LevelBar: View {
-    let pct: Int
-    let low: Int
-    let high: Int
-    let tint: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            GeometryReader { geo in
-                let w = geo.size.width
-                ZStack(alignment: .leading) {
-                    Rectangle().fill(.quaternary)
-                    Rectangle()
-                        .fill(tint.opacity(0.18))
-                        .frame(width: w * CGFloat(high - low) / 100)
-                        .offset(x: w * CGFloat(low) / 100)
-                    Rectangle()
-                        .fill(tint)
-                        .frame(width: w * CGFloat(pct) / 100)
-                    marker(at: low, width: w)
-                    marker(at: high, width: w)
-                }
-                .clipShape(Capsule())
-            }
-            .frame(height: 8)
-
-            Text("循环区间 \(low)% – \(high)%")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private func marker(at value: Int, width: CGFloat) -> some View {
-        Rectangle()
-            .fill(Color.primary.opacity(0.5))
-            .frame(width: 2)
-            .offset(x: width * CGFloat(value) / 100 - 1)
     }
 }
 
