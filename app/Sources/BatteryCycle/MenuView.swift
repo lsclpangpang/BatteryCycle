@@ -91,16 +91,16 @@ struct MenuView: View {
                 get: { model.enabled },
                 set: { model.enabled = $0; model.saveConfig() }
             ))
-            ThresholdSlider(title: "低于此电量开始充电", value: $model.low, range: BatteryModel.lowRange) {
-                model.saveConfig()
-            }
-            .disabled(!model.enabled)
-            ThresholdSlider(title: "充到此电量停止", value: $model.high, range: BatteryModel.highRange) {
-                model.saveConfig()
-            }
-            .disabled(!model.enabled)
+            if model.enabled {
+                ThresholdSlider(title: "低于此电量开始充电", value: $model.low, range: BatteryModel.lowRange) {
+                    model.saveConfig()
+                }
+                ThresholdSlider(title: "充到此电量停止", value: $model.high, range: BatteryModel.highRange) {
+                    model.saveConfig()
+                }
 
-            FullChargeRow()
+                FullChargeRow()
+            }
 
             Divider()
 
